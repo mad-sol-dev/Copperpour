@@ -50,7 +50,15 @@ pub struct McpHandler {
 /// `claude-ai` is what Claude Desktop sends, read from its own MCP log
 /// (`%APPDATA%/Claude/logs`) rather than assumed. Add a client here only with
 /// the same kind of evidence.
-const CLIENTS_THAT_CACHE_TOOL_LIST: &[&str] = &["claude-ai"];
+///
+/// `local-agent-mode-` is the prefix Claude Desktop uses for the second
+/// connection it opens to every configured server when it bridges local MCP
+/// servers into a cloud agent session; the suffix is the server's key in
+/// `claude_desktop_config.json` (e.g. `local-agent-mode-konnect`), read from
+/// `~/.config/Claude/logs/mcp-server-<key>.log` on Linux. That bridge forwards
+/// only the first `tools/list`: after `load_toolset` the server reports the
+/// toolset active, but none of its tools ever reach the agent.
+const CLIENTS_THAT_CACHE_TOOL_LIST: &[&str] = &["claude-ai", "local-agent-mode-"];
 
 pub(crate) fn client_caches_tool_list(client_name: &str) -> bool {
     let name = client_name.trim().to_ascii_lowercase();
@@ -2944,6 +2952,21 @@ mod client_adaptation_tests {
         );
     }
 
+    /// The Claude Desktop bridge into cloud agent sessions, as it appears in
+    /// the app's MCP log: the suffix is the server's config key.
+    #[tokio::test]
+    async fn claude_desktop_cloud_bridge_gets_the_full_catalogue() {
+        let handler = lazy_handler().await;
+        handler
+            .dispatch(&request(
+                "initialize",
+                initialize_from("local-agent-mode-konnect"),
+            ))
+            .await
+            .expect("initialize dispatches");
+        assert_eq!(listed_tool_count(&handler).await, full_catalogue());
+    }
+
     /// A client that honours list_changed keeps the cheap starter kit; the
     /// context economy is the point of the router and must survive this.
     #[tokio::test]
@@ -3017,6 +3040,9 @@ mod client_adaptation_tests {
         assert!(client_caches_tool_list("claude-ai"));
         assert!(client_caches_tool_list("Claude-AI"));
         assert!(client_caches_tool_list("claude-ai-desktop"));
+        assert!(client_caches_tool_list("local-agent-mode-konnect"));
+        assert!(client_caches_tool_list("local-agent-mode-copperpour"));
+        assert!(!client_caches_tool_list("local-agent-mode"));
         assert!(!client_caches_tool_list("claude-code"));
         assert!(!client_caches_tool_list("Claude Code"));
         assert!(!client_caches_tool_list(""));
