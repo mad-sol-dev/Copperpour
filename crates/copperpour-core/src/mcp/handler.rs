@@ -51,13 +51,14 @@ pub struct McpHandler {
 /// (`%APPDATA%/Claude/logs`) rather than assumed. Add a client here only with
 /// the same kind of evidence.
 ///
-/// `local-agent-mode-` is the prefix Claude Desktop uses for the second
-/// connection it opens to every configured server when it bridges local MCP
-/// servers into a cloud agent session; the suffix is the server's key in
-/// `claude_desktop_config.json` (e.g. `local-agent-mode-konnect`), read from
-/// `~/.config/Claude/logs/mcp-server-<key>.log` on Linux. That bridge forwards
-/// only the first `tools/list`: after `load_toolset` the server reports the
-/// toolset active, but none of its tools ever reach the agent.
+/// `local-agent-mode-` is the prefix Claude Desktop uses for a second
+/// connection it opens to every configured server, apparently for cloud agent
+/// sessions; the suffix is the server's key in `claude_desktop_config.json`
+/// (e.g. `local-agent-mode-konnect`), read from
+/// `~/.config/Claude/logs/mcp-server-<key>.log` on Linux. Through it, tools
+/// added by `load_toolset` were never called although the load succeeded,
+/// which points to the same cached first listing as `claude-ai`; that cause is
+/// inferred, not observed inside the app.
 const CLIENTS_THAT_CACHE_TOOL_LIST: &[&str] = &["claude-ai", "local-agent-mode-"];
 
 /// The meta-tool that runs another tool by name (see `dispatch_call_tool`).
