@@ -29,6 +29,17 @@
 //! outline at all, since a plan is an implicit containment claim, not just
 //! an assessment of one.
 //!
+//! # Footprint-owned outlines (#27)
+//!
+//! An imported board can draw its outline as `Edge.Cuts` graphics inside a
+//! footprint and have no top-level one. `score_placement` reads such an
+//! outline ([`copperpour_sexp::board::board_outline`]) when its primitives
+//! chain into closed contours, reports `outline_source: "footprint"` with the
+//! owning references and a warning, and leaves a padless owner (a pure
+//! outline carrier) out of the overlap, outside-outline, connector and
+//! decoupling checks. Nothing is promoted or written. The planners still read only a
+//! top-level outline and refuse without one.
+//!
 //! # Weight table
 //!
 //! The soft-score weights (overlaps ×20 capped 40, outside ×20 capped 40,
@@ -48,8 +59,9 @@ use crate::tools::{get_path, opt_positive_f64, with_board_ipc_classified, ToolCo
 #[cfg(test)]
 use copperpour_sexp::board::board_outline_bbox;
 use copperpour_sexp::board::{
-    board_outline_shape, footprint_courtyards, footprints, CourtyardSource, FootprintCourtyard,
-    OutlineShape, PcbConnectivityIndex, Side,
+    board_outline, board_outline_shape, footprint_courtyards, footprints, BoardOutline,
+    CourtyardSource, FootprintCourtyard, OutlineShape, OutlineSource, PcbConnectivityIndex, Side,
+    OUTLINE_CHAIN_TOLERANCE_MM,
 };
 use copperpour_sexp::parser::SexpNode;
 use plan_status::PlanApplicability;
@@ -70,7 +82,10 @@ pub fn tools() -> Vec<ToolDef> {
          a provably axis-aligned rectangular outline; a concave, notched, rounded, rotated, \
          or multi-boundary outline cannot prove containment from its bbox, so those checks \
          are skipped and the verdict is 'outline_unproven' (see 'outline_shape' in the \
-         response) rather than a silent pass.",
+         response) rather than a silent pass. An outline drawn as Edge.Cuts inside \
+         footprints counts when the board has no top-level one and it forms closed contours: \
+         'outline_source' is then 'footprint', 'outline_owners' names the footprints, and a \
+         padless owner is left out of the overlap checks. The board file is never changed.",
             json!({
                 "type": "object",
                 "properties": {
@@ -298,7 +313,22 @@ async fn handle_score_placement(
     let tree = copperpour_sexp::parse_sexp(&content)?;
 
     let scan = footprint_courtyards(&tree);
-    let outline_shape = board_outline_shape(&tree);
+    let board_outline = board_outline(&tree);
+    let outline_shape = board_outline.shape;
+    // A padless footprint that carries an accepted footprint-owned outline is
+    // the board edge, not a component: its courtyard would overlap every part
+    // on the board. It is left out of every courtyard check (#27).
+    let carriers: Vec<&FootprintCourtyard> = scan
+        .items
+        .iter()
+        .filter(|c| is_outline_carrier(c, &board_outline))
+        .collect();
+    let scored: Vec<FootprintCourtyard> = scan
+        .items
+        .iter()
+        .filter(|c| !is_outline_carrier(c, &board_outline))
+        .cloned()
+        .collect();
     // Containment evidence is authoritative only against a proven-rectangular
     // outline (#594): an `Unproven` shape (concave, notched, rounded,
     // rotated, or multi-boundary) still surfaces its bbox for advisory
@@ -318,8 +348,8 @@ async fn handle_score_placement(
     let mut hard_failures: Vec<serde_json::Value> = Vec::new();
     let mut overlap_refs: BTreeSet<String> = BTreeSet::new();
     let mut overlap_pairs = 0usize;
-    for (i, a) in scan.items.iter().enumerate() {
-        for b in &scan.items[i + 1..] {
+    for (i, a) in scored.iter().enumerate() {
+        for b in &scored[i + 1..] {
             if a.bbox_source == CourtyardSource::AnchorOnly
                 || b.bbox_source == CourtyardSource::AnchorOnly
                 || a.layer_side != b.layer_side
@@ -351,7 +381,7 @@ async fn handle_score_placement(
     // `outline_missing: true` and the verdict can never be "pass".
     let mut outside_refs: Vec<String> = Vec::new();
     if let Some((ox0, oy0, ox1, oy1)) = outline {
-        for c in &scan.items {
+        for c in &scored {
             let (x0, y0, x1, y1) = c.bbox;
             if x0 < ox0 || y0 < oy0 || x1 > ox1 || y1 > oy1 {
                 let reference = courtyard_reference(c);
@@ -376,7 +406,7 @@ async fn handle_score_placement(
     let mut connector_edges: Vec<serde_json::Value> = Vec::new();
     let mut connector_violations: Vec<(String, f64)> = Vec::new();
     if let Some((ox0, oy0, ox1, oy1)) = outline {
-        for c in &scan.items {
+        for c in &scored {
             let Some(reference) = c.reference.as_deref() else {
                 continue;
             };
@@ -402,7 +432,7 @@ async fn handle_score_placement(
         interface_filter_caps,
         associations: decoupling_associations,
         unproven_caps: unproven_decoupling_caps,
-    } = decoupling_check(&scan.items, &index, &values);
+    } = decoupling_check(&scored, &index, &values);
 
     // ── Soft score (ported weight table — see the module docs) ──────────────
     let overlap_deduction = (overlap_pairs as i64 * OVERLAP_POINTS).min(OVERLAP_CAP);
@@ -497,6 +527,14 @@ async fn handle_score_placement(
             OutlineShape::Unproven { .. } => "unproven",
             OutlineShape::Missing => "missing",
         },
+        "outline_source": outline_source_name(board_outline.source),
+        "outline_owners": outline_owner_refs(&board_outline),
+        "outline_contours": outline_contours_json(&board_outline),
+        "outline_carriers_excluded": carriers
+            .iter()
+            .map(|c| courtyard_reference(c))
+            .collect::<Vec<_>>(),
+        "warnings": outline_warnings(&board_outline),
         "hard_failures": hard_failures,
         "deductions": deductions,
         "connector_edges": connector_edges,
@@ -532,10 +570,69 @@ async fn handle_score_placement(
                 "limit_mm": f.limit_mm,
             }))
             .collect::<Vec<_>>(),
-        "footprints_scored": scan.items.len(),
+        "footprints_scored": scored.len(),
         "footprints_skipped": scan.skipped,
         "source": source,
     })))
+}
+
+/// Whether `c` is a padless footprint that owns the accepted footprint-owned
+/// outline — matched by reference and anchor, so a same-named part elsewhere
+/// is not excluded.
+fn is_outline_carrier(c: &FootprintCourtyard, outline: &BoardOutline) -> bool {
+    outline.source == OutlineSource::Footprint
+        && outline
+            .owners
+            .iter()
+            .any(|o| o.padless && o.reference == c.reference && o.at == c.at)
+}
+
+fn outline_source_name(source: OutlineSource) -> &'static str {
+    match source {
+        OutlineSource::None => "missing",
+        OutlineSource::Board => "board",
+        OutlineSource::Footprint => "footprint",
+    }
+}
+
+/// References of the footprints that own footprint `Edge.Cuts` graphics,
+/// `"?"` for one without a reference.
+fn outline_owner_refs(outline: &BoardOutline) -> Vec<String> {
+    outline
+        .owners
+        .iter()
+        .map(|o| o.reference.clone().unwrap_or_else(|| "?".to_string()))
+        .collect()
+}
+
+fn outline_contours_json(outline: &BoardOutline) -> serde_json::Value {
+    json!({
+        "primitives": outline.primitives,
+        "closed": outline.contours.closed,
+        "open": outline.contours.open,
+        "cutouts": outline.contours.cutouts,
+        "tolerance_mm": OUTLINE_CHAIN_TOLERANCE_MM,
+    })
+}
+
+/// Say when the outline comes from footprints, or when footprint `Edge.Cuts`
+/// graphics were found but could not be used.
+fn outline_warnings(outline: &BoardOutline) -> Vec<String> {
+    let owners = outline_owner_refs(outline).join(", ");
+    match outline.source {
+        OutlineSource::Footprint => vec![format!(
+            "the board outline is drawn by footprint(s) {owners}, not by top-level Edge.Cuts \
+             graphics; it is used as found. Moving it to top-level graphics is a manual \
+             import-cleanup step this tool does not perform"
+        )],
+        OutlineSource::None if !outline.owners.is_empty() => vec![format!(
+            "footprint(s) {owners} draw Edge.Cuts graphics, but they do not form closed \
+             contours ({} open chain(s) at a {} mm join tolerance), so they are not used \
+             as the board outline",
+            outline.contours.open, OUTLINE_CHAIN_TOLERANCE_MM
+        )],
+        _ => Vec::new(),
+    }
 }
 
 // ─── Shared plumbing for the placers ─────────────────────────────────────────
@@ -2912,6 +3009,124 @@ mod tests {
         assert_eq!(body["outline_shape"], "unproven", "{body}");
         assert_eq!(body["verdict"], "outline_unproven", "{body}");
         assert_ne!(body["verdict"], "pass");
+    }
+
+    /// KiCad-authored fixtures for #27 (see
+    /// `copperpour-sexp/tests/fixtures/footprint_outline/README.md`): padless
+    /// MECH1 draws the whole outline as footprint `Edge.Cuts` and carries an
+    /// F.CrtYd as large as the board; R1 and R2 sit inside it.
+    const FP_OUTLINE_FRONT: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../copperpour-sexp/tests/fixtures/footprint_outline/footprint_outline_front.kicad_pcb"
+    );
+    const FP_OUTLINE_BACK: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../copperpour-sexp/tests/fixtures/footprint_outline/footprint_outline_back_rot30.kicad_pcb"
+    );
+
+    #[tokio::test]
+    async fn footprint_owned_outline_is_used_and_its_padless_carrier_not_scored() {
+        let before = std::fs::read(FP_OUTLINE_FRONT).unwrap();
+        let response = score(std::path::Path::new(FP_OUTLINE_FRONT)).await;
+        assert_eq!(
+            std::fs::read(FP_OUTLINE_FRONT).unwrap(),
+            before,
+            "scoring must leave the board byte-identical"
+        );
+
+        assert_eq!(response["outline_missing"], false, "{response}");
+        assert_eq!(response["outline_source"], "footprint", "{response}");
+        assert_eq!(response["outline_owners"], json!(["MECH1"]));
+        assert_eq!(response["outline_carriers_excluded"], json!(["MECH1"]));
+        assert_eq!(response["outline_contours"]["primitives"], 16);
+        assert_eq!(response["outline_contours"]["closed"], 2);
+        assert_eq!(response["outline_contours"]["open"], 0);
+        assert_eq!(response["outline_contours"]["cutouts"], 1);
+        // Rounded corners: recognized, but not a containment proof.
+        assert_eq!(response["outline_shape"], "unproven", "{response}");
+        assert_eq!(response["verdict"], "outline_unproven", "{response}");
+        // MECH1's board-sized courtyard would overlap R1 and R2.
+        assert_eq!(response["hard_failures"].as_array().unwrap().len(), 0);
+        assert_eq!(response["score"], 100);
+        assert_eq!(response["footprints_scored"], 2);
+        let warnings = response["warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(), 1, "{response}");
+        assert!(warnings[0].as_str().unwrap().contains("MECH1"));
+        assert!(warnings[0].as_str().unwrap().contains("manual"));
+    }
+
+    /// The same MECH1 with one pad is a component, not a pure outline
+    /// carrier: its courtyard is scored and overlaps R1 and R2.
+    #[tokio::test]
+    async fn an_outline_owner_with_pads_is_still_scored() {
+        let fixture = std::fs::read_to_string(FP_OUTLINE_FRONT).unwrap();
+        let marker = "(property \"Reference\" \"MECH1\"";
+        assert_eq!(fixture.matches(marker).count(), 1);
+        let with_pad = fixture.replacen(
+            marker,
+            &format!(
+                "(pad \"\" np_thru_hole circle (at 60 40) (size 3 3) (drill 3) \
+                 (layers \"*.Cu\" \"*.Mask\"))\n\t\t{marker}"
+            ),
+            1,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("with_pad.kicad_pcb");
+        std::fs::write(&path, with_pad).unwrap();
+
+        let response = score(&path).await;
+        assert_eq!(response["outline_source"], "footprint", "{response}");
+        assert_eq!(response["outline_carriers_excluded"], json!([]));
+        assert_eq!(response["verdict"], "hard_fail", "{response}");
+        assert_eq!(response["hard_failures"].as_array().unwrap().len(), 2);
+        assert_eq!(response["footprints_scored"], 3);
+    }
+
+    /// Back side, rotated 30°: same recognition and exclusion.
+    #[tokio::test]
+    async fn footprint_owned_outline_on_the_back_rotated_is_used() {
+        let response = score(std::path::Path::new(FP_OUTLINE_BACK)).await;
+        assert_eq!(response["outline_source"], "footprint", "{response}");
+        assert_eq!(response["outline_owners"], json!(["MECH1"]));
+        assert_eq!(response["outline_carriers_excluded"], json!(["MECH1"]));
+        assert_eq!(response["outline_contours"]["closed"], 2);
+        assert_eq!(response["outline_contours"]["cutouts"], 1);
+        assert_eq!(response["hard_failures"].as_array().unwrap().len(), 0);
+    }
+
+    /// Footprint `Edge.Cuts` graphics that do not close stay unused: the
+    /// outline is still missing, and a warning says why. MECH1 is then an
+    /// ordinary footprint again, so its courtyard overlaps R1 and R2.
+    #[tokio::test]
+    async fn an_open_footprint_outline_stays_missing_with_a_warning() {
+        let fixture = std::fs::read_to_string(FP_OUTLINE_FRONT).unwrap();
+        let opened = fixture.replacen("(end 65 -50)", "(end 64.9 -50)", 1);
+        assert_ne!(opened, fixture);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("open.kicad_pcb");
+        std::fs::write(&path, opened).unwrap();
+
+        let response = score(&path).await;
+        assert_eq!(response["verdict"], "hard_fail", "{response}");
+        assert_eq!(response["outline_missing"], true);
+        assert_eq!(response["outline_source"], "missing");
+        assert_eq!(response["outline_owners"], json!(["MECH1"]));
+        assert_eq!(response["outline_carriers_excluded"], json!([]));
+        assert_eq!(response["outline_contours"]["open"], 1);
+        let warnings = response["warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(), 1, "{response}");
+        assert!(warnings[0].as_str().unwrap().contains("closed contours"));
+    }
+
+    /// A top-level outline reports its source and no warning.
+    #[tokio::test]
+    async fn a_top_level_outline_reports_board_as_its_source() {
+        let response = score(std::path::Path::new(FIXTURE)).await;
+        assert_eq!(response["outline_source"], "board", "{response}");
+        assert_eq!(response["outline_owners"], json!([]));
+        assert_eq!(response["outline_carriers_excluded"], json!([]));
+        assert_eq!(response["warnings"], json!([]));
+        assert_eq!(response["outline_contours"]["closed"], 1);
     }
 
     /// Move ONE footprint's root anchor by string surgery on the

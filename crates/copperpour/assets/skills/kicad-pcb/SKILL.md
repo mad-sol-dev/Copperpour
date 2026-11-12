@@ -221,6 +221,11 @@ an unproved outline is not completion evidence.
   `outline_unproven` like `outline_missing`, not like `pass`; validate a
   non-rectangular board's real fit with KiCad DRC and report `BLOCKED` for the
   unavailable containment proof.
+- An imported board may draw its outline as Edge.Cuts inside a footprint.
+  `score_placement` then reports `outline_source: "footprint"`, the owners in
+  `outline_owners`, and leaves a padless owner out of the overlap checks
+  (`outline_carriers_excluded`). Do not move or delete that footprint to "fix"
+  the outline; promoting it to top-level graphics is a manual cleanup step.
 - `auto_place_from_schematic` returns a deterministic net-clustered starting
   plan for diagnosis. It never writes: `dry_run: false` returns structured
   **plan_blocked**.

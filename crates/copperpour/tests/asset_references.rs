@@ -740,6 +740,10 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "outline_shape",
         "outline_unproven",
         "outline_missing",
+        // Footprint-owned outline response fields (#27), not callable tools.
+        "outline_source",
+        "outline_owners",
+        "outline_carriers_excluded",
         // Shared placement-plan response fields, not callable tools.
         "plan_status",
         "blocking_reasons",

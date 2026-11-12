@@ -969,3 +969,157 @@ fn installed_demo_boards_report_genuinely_locked_footprints() {
          is matching pad- or graphic-level locks, not footprint-level ones"
     );
 }
+
+// ─── Footprint-owned Edge.Cuts outline (#27) ─────────────────────────────────
+//
+// `footprint_outline/*.kicad_pcb` were written by KiCad 10.0.7's own pcbnew
+// (see `footprint_outline/README.md`). The expected numbers are KiCad's, read
+// back from the saved files with `BOARD::GetBoardPolygonOutlines`, not
+// derived from Copperpour's transform: the transform is what is under test.
+
+use copperpour_sexp::board::{
+    board_outline, board_outline_shape, OutlineShape, OutlineSource, OUTLINE_CHAIN_TOLERANCE_MM,
+};
+
+fn assert_bbox_near(got: (f64, f64, f64, f64), want: (f64, f64, f64, f64), tol: f64, label: &str) {
+    let ok = (got.0 - want.0).abs() <= tol
+        && (got.1 - want.1).abs() <= tol
+        && (got.2 - want.2).abs() <= tol
+        && (got.3 - want.3).abs() <= tol;
+    assert!(
+        ok,
+        "{label}: got {got:?}, expected {want:?} within {tol} mm"
+    );
+}
+
+/// The cutout is the closed contour that is not the outer one.
+fn cutout_bbox(contours: &[(f64, f64, f64, f64)]) -> (f64, f64, f64, f64) {
+    let area = |b: &(f64, f64, f64, f64)| (b.2 - b.0) * (b.3 - b.1);
+    *contours
+        .iter()
+        .min_by(|a, b| area(a).total_cmp(&area(b)))
+        .expect("at least one contour")
+}
+
+/// Front side, 0°: MECH1 at (100, 100) draws a 140 × 100 mm rounded outline
+/// (4 lines + 4 arcs) and a 24.25 × 7.333 mm rounded cutout (4 lines + 4
+/// arcs). KiCad's outline polygon: bbox (30, 50)..(170, 150), one outline
+/// with one hole at (107.875, 106.3335)..(132.125, 113.6665).
+#[test]
+fn footprint_owned_outline_front_side_matches_kicad() {
+    let tree = fixture("footprint_outline/footprint_outline_front.kicad_pcb");
+    let outline = board_outline(&tree);
+
+    assert_eq!(outline.source, OutlineSource::Footprint);
+    assert_eq!(outline.primitives, 16);
+    assert_eq!(outline.owners.len(), 1);
+    let owner = &outline.owners[0];
+    assert_eq!(owner.reference.as_deref(), Some("MECH1"));
+    assert_eq!(owner.at, (100.0, 100.0));
+    assert!(owner.padless);
+    assert_eq!(owner.primitives, 16);
+
+    assert_eq!(outline.contours.closed, 2);
+    assert_eq!(outline.contours.open, 0);
+    assert_eq!(outline.contours.cutouts, 1);
+    match outline.shape {
+        OutlineShape::Unproven { bbox } => {
+            assert_bbox_near(bbox, (30.0, 50.0, 170.0, 150.0), 1e-9, "outline")
+        }
+        other => panic!("rounded outline must be unproven, got {other:?}"),
+    }
+    let hole = cutout_bbox(&outline.contours.closed_bboxes);
+    assert_bbox_near(hole, (107.875, 106.3335, 132.125, 113.6665), 1e-9, "cutout");
+    assert!((hole.2 - hole.0 - 24.25).abs() < 1e-9);
+    assert!((hole.3 - hole.1 - 7.333).abs() < 1e-9);
+
+    // Planners keep reading only a top-level outline.
+    assert_eq!(board_outline_shape(&tree), OutlineShape::Missing);
+    assert_eq!(board_outline_bbox(&tree), None);
+}
+
+/// Back side, rotated: the same MECH1, turned 30° and flipped to B.Cu by
+/// pcbnew (`(at 100 100 -30)`, children rewritten mirrored). KiCad's own
+/// outline polygon: bbox (16.21073, 23.531238)..(183.78927, 176.468784), hole
+/// bbox (110.350682, 92.466096)..(134.290328, 110.213389). KiCad turns arcs
+/// into chords for this polygon (vertices on the arc), so its bbox can sit
+/// up to its arc error inside the exact one; 0.01 mm covers that. A transform
+/// that mirrored the stored children a second time would put the cutout on
+/// the other side of the anchor and miss this by millimetres.
+#[test]
+fn footprint_owned_outline_back_side_rotated_matches_kicad() {
+    let tree = fixture("footprint_outline/footprint_outline_back_rot30.kicad_pcb");
+    let outline = board_outline(&tree);
+
+    assert_eq!(outline.source, OutlineSource::Footprint);
+    assert_eq!(outline.primitives, 16);
+    assert_eq!(outline.contours.closed, 2);
+    assert_eq!(outline.contours.open, 0);
+    assert_eq!(outline.contours.cutouts, 1);
+    let bbox = outline.shape.bbox().expect("outline bbox");
+    assert_bbox_near(
+        bbox,
+        (16.21073, 23.531238, 183.78927, 176.468784),
+        0.01,
+        "rotated outline",
+    );
+    assert_bbox_near(
+        cutout_bbox(&outline.contours.closed_bboxes),
+        (110.350682, 92.466096, 134.290328, 110.213389),
+        0.01,
+        "rotated cutout",
+    );
+}
+
+/// A gap larger than the join tolerance leaves the footprint graphics
+/// unused: the outline stays missing, but the owner is still named so the
+/// caller can say why.
+#[test]
+fn an_open_footprint_outline_is_not_accepted() {
+    let content = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/footprint_outline/footprint_outline_front.kicad_pcb"),
+    )
+    .unwrap();
+    // Shorten the outer top edge (local y = -50) by 0.1 mm.
+    let opened = content.replacen("(end 65 -50)", "(end 64.9 -50)", 1);
+    assert_ne!(opened, content, "fixture holds the edge being opened");
+    let tree = parse_sexp(&opened).unwrap();
+    let outline = board_outline(&tree);
+
+    assert_eq!(outline.source, OutlineSource::None);
+    assert_eq!(outline.shape, OutlineShape::Missing);
+    assert_eq!(outline.contours.open, 1);
+    assert_eq!(outline.contours.closed, 1);
+    assert_eq!(outline.owners.len(), 1);
+    const { assert!(0.1 > OUTLINE_CHAIN_TOLERANCE_MM) };
+}
+
+/// A top-level outline wins: footprint `Edge.Cuts` graphics are not added to
+/// it, so a board that had a top-level outline reads exactly as before.
+#[test]
+fn a_top_level_outline_ignores_footprint_edge_cuts() {
+    let content = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/footprint_outline/footprint_outline_front.kicad_pcb"),
+    )
+    .unwrap();
+    let with_rect = content.replacen(
+        "\t(footprint ",
+        "\t(gr_rect (start 0 0) (end 200 200) (stroke (width 0.1) (type solid)) \
+         (fill no) (layer \"Edge.Cuts\"))\n\t(footprint ",
+        1,
+    );
+    let tree = parse_sexp(&with_rect).unwrap();
+    let outline = board_outline(&tree);
+
+    assert_eq!(outline.source, OutlineSource::Board);
+    assert!(outline.owners.is_empty());
+    assert_eq!(
+        outline.shape,
+        OutlineShape::Rectangular {
+            bbox: (0.0, 0.0, 200.0, 200.0)
+        }
+    );
+    assert_eq!(board_outline_shape(&tree), outline.shape);
+}

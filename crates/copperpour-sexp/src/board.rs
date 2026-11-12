@@ -394,54 +394,376 @@ impl OutlineShape {
     }
 }
 
-const EDGE_TAGS: [&str; 6] = [
-    "gr_line",
-    "gr_rect",
-    "gr_arc",
-    "gr_circle",
-    "gr_curve",
-    "gr_poly",
-];
+/// Graphic tags that can carry an `Edge.Cuts` outline primitive, without
+/// their `gr_`/`fp_` prefix. A footprint has no `fp_curve` in current
+/// formats, but pcbnew still reads one, so it is accepted on both levels.
+const EDGE_KINDS: [&str; 6] = ["line", "rect", "arc", "circle", "curve", "poly"];
 
-/// Classify the board outline's proven shape — see [`OutlineShape`].
-pub fn board_outline_shape(tree: &SexpNode) -> OutlineShape {
-    let mut acc: Option<(f64, f64, f64, f64)> = None;
-    let mut edges: Vec<(&str, &SexpNode)> = Vec::new();
+/// Distance in mm within which two primitive endpoints count as the same
+/// point when [`BoardOutline::contours`] chains them into contours. One
+/// micrometre: far below any manufacturable feature, far above the
+/// floating-point noise a rotated footprint adds to its coordinates.
+pub const OUTLINE_CHAIN_TOLERANCE_MM: f64 = 0.001;
+
+/// Which graphics the board outline was read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutlineSource {
+    /// No usable outline: see [`BoardOutline::shape`], which is `Missing`.
+    None,
+    /// Top-level `gr_*` graphics on `Edge.Cuts`. When a board has any, they
+    /// are the outline; `Edge.Cuts` graphics inside footprints (a connector's
+    /// board notch, say) are not added to it.
+    Board,
+    /// `fp_*` graphics on `Edge.Cuts` owned by placed footprints, on a board
+    /// with no top-level `Edge.Cuts` graphic at all — an imported board
+    /// whose outline lives in a mechanical or module footprint. Accepted only
+    /// when they chain into closed contours with no open end.
+    Footprint,
+}
+
+/// A footprint that draws part of a footprint-owned outline.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutlineOwner {
+    /// The reference designator, `None` when the footprint has none.
+    pub reference: Option<String>,
+    /// The footprint anchor in board coordinates, to tell two footprints
+    /// with the same reference apart.
+    pub at: (f64, f64),
+    /// Whether the footprint has no pads at all: a pure outline carrier,
+    /// not a component.
+    pub padless: bool,
+    /// How many `Edge.Cuts` primitives the footprint contributes.
+    pub primitives: usize,
+}
+
+/// How the outline primitives chain into contours, endpoints joined within
+/// [`OUTLINE_CHAIN_TOLERANCE_MM`].
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct OutlineContours {
+    /// Contours that return to their start: an external boundary or a cutout.
+    pub closed: usize,
+    /// Chains that end without meeting their start: a gap in the outline.
+    pub open: usize,
+    /// Closed contours whose bbox lies strictly inside another closed
+    /// contour's bbox: internal cutouts. A bbox test, not a polygon test.
+    pub cutouts: usize,
+    /// The bbox `(min_x, min_y, max_x, max_y)` of each closed contour, in
+    /// board coordinates, in the order the contours were found.
+    pub closed_bboxes: Vec<(f64, f64, f64, f64)>,
+}
+
+/// The board outline with where it came from — [`OutlineShape`] plus the
+/// evidence a caller needs to report it truthfully.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoardOutline {
+    /// The proven shape class, as [`board_outline_shape`] would classify the
+    /// same primitives.
+    pub shape: OutlineShape,
+    /// Which graphics the shape was read from.
+    pub source: OutlineSource,
+    /// Footprints that own the outline's primitives, in file order. Filled
+    /// for a footprint-owned outline, and also when footprint `Edge.Cuts`
+    /// graphics were found but rejected (open contours), so the caller can
+    /// name them; empty for a top-level outline.
+    pub owners: Vec<OutlineOwner>,
+    /// How many primitives the outline was read from (or, when rejected,
+    /// would have been).
+    pub primitives: usize,
+    /// Contour chaining over those primitives; all zero when there are none.
+    pub contours: OutlineContours,
+}
+
+/// The board outline including one drawn inside footprints — see
+/// [`OutlineSource`] for which graphics count.
+///
+/// Read-only analysis: footprint children are placed in board coordinates
+/// with the footprint's rigid-body transform (the convention documented on
+/// [`FootprintCourtyard`], back side included), and nothing is promoted or
+/// rewritten. Malformed geometry is all-or-nothing, as in
+/// [`board_outline_shape`]: one unreadable footprint `Edge.Cuts` primitive,
+/// or an owning footprint without a readable `(at …)`, makes the outline
+/// `Missing` rather than a partial one.
+pub fn board_outline(tree: &SexpNode) -> BoardOutline {
+    let missing = |source_owners: Vec<OutlineOwner>, prims: &[EdgePrim]| BoardOutline {
+        shape: OutlineShape::Missing,
+        source: OutlineSource::None,
+        owners: source_owners,
+        primitives: prims.len(),
+        contours: outline_contours(prims),
+    };
+
+    let mut top: Vec<EdgePrim> = Vec::new();
+    let mut top_edge_count = 0usize;
     for child in tree.children().unwrap_or(&[]) {
-        let Some(head) = child.head() else { continue };
-        if !EDGE_TAGS.contains(&head) || child.find_str("layer") != Some("Edge.Cuts") {
+        let Some(kind) = edge_kind(child, "gr_") else {
+            continue;
+        };
+        top_edge_count += 1;
+        match edge_prim(child, kind, None) {
+            Some(prim) => top.push(prim),
+            None => return missing(Vec::new(), &[]),
+        }
+    }
+    if top_edge_count > 0 {
+        return BoardOutline {
+            shape: classify_outline(&top),
+            source: OutlineSource::Board,
+            owners: Vec::new(),
+            primitives: top.len(),
+            contours: outline_contours(&top),
+        };
+    }
+
+    let mut prims: Vec<EdgePrim> = Vec::new();
+    let mut owners: Vec<OutlineOwner> = Vec::new();
+    for fp in footprints(tree) {
+        let edges: Vec<(&SexpNode, &str)> = fp
+            .children()
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|c| Some((c, edge_kind(c, "fp_")?)))
+            .collect();
+        if edges.is_empty() {
             continue;
         }
-        let Some(bb) = graphic_bbox(child, head) else {
-            return OutlineShape::Missing;
+        let Some(xf) = footprint_root_at(fp) else {
+            return missing(Vec::new(), &[]);
         };
-        acc = Some(match acc {
-            None => bb,
-            Some((x0, y0, x1, y1)) => (x0.min(bb.0), y0.min(bb.1), x1.max(bb.2), y1.max(bb.3)),
+        for (node, kind) in &edges {
+            match edge_prim(node, kind, Some(xf)) {
+                Some(prim) => prims.push(prim),
+                None => return missing(Vec::new(), &[]),
+            }
+        }
+        owners.push(OutlineOwner {
+            reference: footprint_reference(fp),
+            at: (xf.0, xf.1),
+            padless: fp.find("pad").is_none(),
+            primitives: edges.len(),
         });
-        edges.push((head, child));
     }
-    let Some(bbox) = acc else {
+    let contours = outline_contours(&prims);
+    if prims.is_empty() || contours.open > 0 || contours.closed == 0 {
+        return missing(owners, &prims);
+    }
+    BoardOutline {
+        shape: classify_outline(&prims),
+        source: OutlineSource::Footprint,
+        owners,
+        primitives: prims.len(),
+        contours,
+    }
+}
+
+/// Classify the board outline's proven shape — see [`OutlineShape`].
+///
+/// Reads top-level `gr_*` `Edge.Cuts` graphics only. Placement planners use
+/// this so that a plan, which is a containment claim, is never made against
+/// a footprint-owned outline; read-only analysis that should also see a
+/// footprint-owned outline calls [`board_outline`].
+pub fn board_outline_shape(tree: &SexpNode) -> OutlineShape {
+    match board_outline(tree) {
+        BoardOutline {
+            source: OutlineSource::Board,
+            shape,
+            ..
+        } => shape,
+        _ => OutlineShape::Missing,
+    }
+}
+
+/// One `Edge.Cuts` primitive in board coordinates.
+#[derive(Debug, Clone, PartialEq)]
+enum EdgePrim {
+    Line((f64, f64), (f64, f64)),
+    /// A top-level, axis-aligned `gr_rect`. A footprint's `fp_rect` turns
+    /// with the footprint, so it becomes a four-vertex [`EdgePrim::Poly`].
+    Rect((f64, f64), (f64, f64)),
+    Arc((f64, f64), (f64, f64), (f64, f64)),
+    Circle((f64, f64), f64),
+    /// Bézier control points, first and last on the curve.
+    Curve(Vec<(f64, f64)>),
+    /// Polygon vertices, closing implicitly from last to first.
+    Poly(Vec<(f64, f64)>),
+}
+
+/// The kind (`"line"`, `"arc"`, …) of an `Edge.Cuts` graphic carrying
+/// `prefix`, or `None` for anything else.
+fn edge_kind<'a>(node: &'a SexpNode, prefix: &str) -> Option<&'a str> {
+    let kind = node.head()?.strip_prefix(prefix)?;
+    (EDGE_KINDS.contains(&kind) && node.find_str("layer") == Some("Edge.Cuts")).then_some(kind)
+}
+
+/// Read one primitive, pushed through the footprint transform `xf`
+/// (`(x, y, rotation)`) when it is a footprint child. `None` when a
+/// load-bearing coordinate is missing or non-finite.
+fn edge_prim(node: &SexpNode, kind: &str, xf: Option<(f64, f64, f64)>) -> Option<EdgePrim> {
+    let place = |p: (f64, f64)| match xf {
+        Some((fx, fy, rot)) => crate::geometry::transform_pad(p.0, p.1, fx, fy, rot),
+        None => p,
+    };
+    let pts = || -> Option<Vec<(f64, f64)>> {
+        let mut out = Vec::new();
+        for xy in node.find("pts")?.find_all("xy") {
+            let (x, y) = (xy.get_f64(1)?, xy.get_f64(2)?);
+            if !x.is_finite() || !y.is_finite() {
+                return None;
+            }
+            out.push(place((x, y)));
+        }
+        (!out.is_empty()).then_some(out)
+    };
+    Some(match kind {
+        "line" => EdgePrim::Line(place(point(node, "start")?), place(point(node, "end")?)),
+        "rect" => {
+            let (s, e) = (point(node, "start")?, point(node, "end")?);
+            if xf.is_none() {
+                EdgePrim::Rect(s, e)
+            } else {
+                EdgePrim::Poly(
+                    [s, (e.0, s.1), e, (s.0, e.1)]
+                        .into_iter()
+                        .map(place)
+                        .collect(),
+                )
+            }
+        }
+        "arc" => EdgePrim::Arc(
+            place(point(node, "start")?),
+            place(point(node, "mid")?),
+            place(point(node, "end")?),
+        ),
+        "circle" => {
+            let (c, e) = (place(point(node, "center")?), place(point(node, "end")?));
+            EdgePrim::Circle(c, (e.0 - c.0).hypot(e.1 - c.1))
+        }
+        "curve" => EdgePrim::Curve(pts()?),
+        "poly" => EdgePrim::Poly(pts()?),
+        _ => return None,
+    })
+}
+
+/// Bbox of one primitive. Arcs use exact extrema
+/// ([`crate::geometry::arc_bbox`]); a Bézier curve uses its control-point
+/// hull, a (tight enough) superset of the curve; a polygon's vertex hull is
+/// exact, since its edges are straight.
+fn prim_bbox(prim: &EdgePrim) -> (f64, f64, f64, f64) {
+    let hull = |pts: &[(f64, f64)]| {
+        pts.iter()
+            .fold(None, |acc, &(x, y)| Some(merge_bbox(acc, (x, y, x, y))))
+    };
+    match prim {
+        EdgePrim::Line(a, b) | EdgePrim::Rect(a, b) => {
+            (a.0.min(b.0), a.1.min(b.1), a.0.max(b.0), a.1.max(b.1))
+        }
+        EdgePrim::Arc(s, m, e) => crate::geometry::arc_bbox(*s, *m, *e),
+        EdgePrim::Circle((cx, cy), r) => (cx - r, cy - r, cx + r, cy + r),
+        EdgePrim::Curve(pts) | EdgePrim::Poly(pts) => {
+            hull(pts).expect("edge_prim never builds an empty point list")
+        }
+    }
+}
+
+/// [`OutlineShape`] of a primitive set: `Missing` when empty, else
+/// `Rectangular` or `Unproven` around the merged bbox.
+fn classify_outline(prims: &[EdgePrim]) -> OutlineShape {
+    let Some(bbox) = prims
+        .iter()
+        .fold(None, |acc, p| Some(merge_bbox(acc, prim_bbox(p))))
+    else {
         return OutlineShape::Missing;
     };
-    if is_axis_aligned_rectangle(&edges, bbox) {
+    if is_axis_aligned_rectangle(prims, bbox) {
         OutlineShape::Rectangular { bbox }
     } else {
         OutlineShape::Unproven { bbox }
     }
 }
 
-/// Whether `edges` (the full Edge.Cuts graphic set, in source order) reduces
-/// to exactly one axis-aligned rectangle: a single `gr_rect`; a single
-/// `gr_poly` whose deduplicated vertices, taken in order, trace the bbox
-/// perimeter; or exactly four `gr_line` segments that are the bbox's four
-/// sides, each exactly once.
+/// Chain the primitives into contours. A rect, circle or polygon is a
+/// closed contour by itself; lines, arcs and curves join end to end when
+/// their endpoints lie within [`OUTLINE_CHAIN_TOLERANCE_MM`], in either
+/// direction.
+fn outline_contours(prims: &[EdgePrim]) -> OutlineContours {
+    let near =
+        |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).hypot(a.1 - b.1) <= OUTLINE_CHAIN_TOLERANCE_MM;
+    let mut closed_boxes: Vec<(f64, f64, f64, f64)> = Vec::new();
+    let mut open = 0usize;
+    // (primitive index, start, end) of each line, arc or curve.
+    let mut chains: Vec<(usize, Point, Point)> = Vec::new();
+    for (i, prim) in prims.iter().enumerate() {
+        match prim {
+            EdgePrim::Rect(..) | EdgePrim::Circle(..) | EdgePrim::Poly(..) => {
+                closed_boxes.push(prim_bbox(prim));
+            }
+            EdgePrim::Line(s, e) | EdgePrim::Arc(s, _, e) => chains.push((i, *s, *e)),
+            EdgePrim::Curve(pts) => {
+                chains.push((i, pts[0], pts[pts.len() - 1]));
+            }
+        }
+    }
+    let mut used = vec![false; chains.len()];
+    for first in 0..chains.len() {
+        if used[first] {
+            continue;
+        }
+        used[first] = true;
+        let (_, mut start, mut end) = chains[first];
+        let mut bbox = prim_bbox(&prims[chains[first].0]);
+        // Grow the chain at its end, then at its start, so one gap counts as
+        // one open chain wherever the walk began.
+        for grow_end in [true, false] {
+            while !near(start, end) {
+                let tip = if grow_end { end } else { start };
+                let next = (0..chains.len())
+                    .find(|&j| !used[j] && (near(chains[j].1, tip) || near(chains[j].2, tip)));
+                let Some(j) = next else { break };
+                used[j] = true;
+                let far = if near(chains[j].1, tip) {
+                    chains[j].2
+                } else {
+                    chains[j].1
+                };
+                if grow_end {
+                    end = far;
+                } else {
+                    start = far;
+                }
+                bbox = merge_bbox(Some(bbox), prim_bbox(&prims[chains[j].0]));
+            }
+        }
+        if near(start, end) {
+            closed_boxes.push(bbox);
+        } else {
+            open += 1;
+        }
+    }
+    let inside = |a: (f64, f64, f64, f64), b: (f64, f64, f64, f64)| {
+        a != b && a.0 > b.0 && a.1 > b.1 && a.2 < b.2 && a.3 < b.3
+    };
+    let cutouts = closed_boxes
+        .iter()
+        .filter(|a| closed_boxes.iter().any(|b| inside(**a, *b)))
+        .count();
+    OutlineContours {
+        closed: closed_boxes.len(),
+        open,
+        cutouts,
+        closed_bboxes: closed_boxes,
+    }
+}
+
+/// Whether `prims` (the full outline primitive set, in source order)
+/// reduces to exactly one axis-aligned rectangle: a single `gr_rect`; a
+/// single polygon whose deduplicated vertices, taken in order, trace the
+/// bbox perimeter; or exactly four lines that are the bbox's four sides,
+/// each exactly once.
 ///
 /// Corner membership alone is not a proof: four lines can touch all four
 /// corners while one side is doubled and another missing (an open outline),
 /// and a polygon's four corners in bow-tie order cross itself. Both reduce
 /// to [`is_bbox_perimeter`], which checks the sides, not the points.
-fn is_axis_aligned_rectangle(edges: &[(&str, &SexpNode)], bbox: (f64, f64, f64, f64)) -> bool {
+fn is_axis_aligned_rectangle(prims: &[EdgePrim], bbox: (f64, f64, f64, f64)) -> bool {
     let (x0, y0, x1, y1) = bbox;
     if x0 >= x1 || y0 >= y1 {
         return false; // Degenerate (zero-area) bbox proves nothing.
@@ -449,19 +771,13 @@ fn is_axis_aligned_rectangle(edges: &[(&str, &SexpNode)], bbox: (f64, f64, f64, 
     // Perimeter order: corner `i` and corner `(i + 1) % 4` share a side.
     let corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)];
 
-    match edges {
-        [("gr_rect", _)] => true,
-        [("gr_poly", node)] => {
-            let Some(pts) = node.find("pts") else {
-                return false;
-            };
+    match prims {
+        [EdgePrim::Rect(..)] => true,
+        [EdgePrim::Poly(pts)] => {
             let mut verts: Vec<(f64, f64)> = Vec::new();
-            for xy in pts.find_all("xy") {
-                let (Some(x), Some(y)) = (xy.get_f64(1), xy.get_f64(2)) else {
-                    return false;
-                };
-                if verts.last() != Some(&(x, y)) {
-                    verts.push((x, y));
+            for &p in pts {
+                if verts.last() != Some(&p) {
+                    verts.push(p);
                 }
             }
             if verts.len() > 1 && verts.first() == verts.last() {
@@ -475,19 +791,22 @@ fn is_axis_aligned_rectangle(edges: &[(&str, &SexpNode)], bbox: (f64, f64, f64, 
             let sides: Vec<_> = (0..4).map(|i| (verts[i], verts[(i + 1) % 4])).collect();
             is_bbox_perimeter(&sides, &corners)
         }
-        [("gr_line", _), ("gr_line", _), ("gr_line", _), ("gr_line", _)] => {
-            let mut sides = Vec::with_capacity(4);
-            for (_, node) in edges {
-                let (Some(s), Some(e)) = (point(node, "start"), point(node, "end")) else {
-                    return false;
-                };
-                sides.push((s, e));
-            }
+        [EdgePrim::Line(..), EdgePrim::Line(..), EdgePrim::Line(..), EdgePrim::Line(..)] => {
+            let sides: Vec<Segment> = prims
+                .iter()
+                .filter_map(|p| match p {
+                    EdgePrim::Line(s, e) => Some((*s, *e)),
+                    _ => None,
+                })
+                .collect();
             is_bbox_perimeter(&sides, &corners)
         }
         _ => false,
     }
 }
+
+/// A board-coordinate point `(x, y)` in mm.
+type Point = (f64, f64);
 
 /// One straight outline edge, `(start, end)`.
 type Segment = ((f64, f64), (f64, f64));
@@ -546,54 +865,6 @@ fn close(a: (f64, f64), b: (f64, f64)) -> bool {
 /// containment check should use instead.
 pub fn board_outline_bbox(tree: &SexpNode) -> Option<(f64, f64, f64, f64)> {
     board_outline_shape(tree).bbox()
-}
-
-/// Bbox of a single edge graphic; `None` when a load-bearing coordinate is
-/// missing or non-finite.
-fn graphic_bbox(node: &SexpNode, head: &str) -> Option<(f64, f64, f64, f64)> {
-    match head {
-        "gr_line" | "gr_rect" => {
-            let (x1, y1) = point(node, "start")?;
-            let (x2, y2) = point(node, "end")?;
-            Some((x1.min(x2), y1.min(y2), x1.max(x2), y1.max(y2)))
-        }
-        "gr_arc" => {
-            let start = point(node, "start")?;
-            let mid = point(node, "mid")?;
-            let end = point(node, "end")?;
-            Some(crate::geometry::arc_bbox(start, mid, end))
-        }
-        "gr_circle" => {
-            let (cx, cy) = point(node, "center")?;
-            let (ex, ey) = point(node, "end")?;
-            let r = (ex - cx).hypot(ey - cy);
-            Some((cx - r, cy - r, cx + r, cy + r))
-        }
-        // Cubic Bézier: the control polygon contains the curve, so its hull
-        // is a valid (if slightly loose) bbox.
-        //
-        // gr_poly: a straight-edged polygon, so the same vertex-hull bbox is
-        // exact rather than a superset.
-        "gr_curve" | "gr_poly" => pts_bbox(node),
-        _ => None,
-    }
-}
-
-/// Bbox of every `(xy x y)` vertex under a node's `pts` child.
-fn pts_bbox(node: &SexpNode) -> Option<(f64, f64, f64, f64)> {
-    let pts = node.find("pts")?;
-    let mut acc: Option<(f64, f64, f64, f64)> = None;
-    for xy in pts.find_all("xy") {
-        let (x, y) = (xy.get_f64(1)?, xy.get_f64(2)?);
-        if !x.is_finite() || !y.is_finite() {
-            return None;
-        }
-        acc = Some(match acc {
-            None => (x, y, x, y),
-            Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
-        });
-    }
-    acc
 }
 
 /// `(tag x y)` as a finite coordinate pair, or `None` — never a zero-filled
