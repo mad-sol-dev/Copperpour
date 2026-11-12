@@ -8,4 +8,7 @@ that region and the closest pads of other nets. A group or skip pattern also
 matches a sheet-local net by the name after its last `/`. `image: true` adds
 a picture as an image block. It reads the board live from KiCad when open
 there, else the saved file, as `score_placement` does. No caller needs to
-change anything.
+change anything. The outline is the
+top-level `Edge.Cuts` outline or, on a board without one, closed `Edge.Cuts`
+contours drawn inside footprints; `outline_source` (`"board"`, `"footprint"`
+or `"missing"`) says which.

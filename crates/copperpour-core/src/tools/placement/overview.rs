@@ -21,7 +21,8 @@ use crate::tool;
 use crate::tools::pcb_routing::wildcard_matches;
 use crate::tools::{get_path, ToolContext, ToolDef};
 use copperpour_sexp::board::{
-    board_outline_shape, footprint_courtyards, FootprintCourtyard, PadSite, PcbConnectivityIndex,
+    board_outline, footprint_courtyards, FootprintCourtyard, OutlineSource, PadSite,
+    PcbConnectivityIndex,
 };
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -94,7 +95,10 @@ async fn handle_placement_overview(
     let tree = copperpour_sexp::parse_sexp(&content)?;
     let index = PcbConnectivityIndex::build(&tree);
     let courtyards = footprint_courtyards(&tree).items;
-    let outline = board_outline_shape(&tree).bbox();
+    // An outline drawn inside footprints counts too (#27): this is a report,
+    // not a containment proof or a plan.
+    let board_outline = board_outline(&tree);
+    let outline = board_outline.shape.bbox();
 
     let top = args["top"]
         .as_u64()
@@ -266,6 +270,11 @@ async fn handle_placement_overview(
         "footprints": courtyards.len(),
         "pads": nets.iter().map(|net| index.pads_of_net(net).len()).sum::<usize>(),
         "outline_bbox": outline.map(bbox_json),
+        "outline_source": match board_outline.source {
+            OutlineSource::None => "missing",
+            OutlineSource::Board => "board",
+            OutlineSource::Footprint => "footprint",
+        },
         "outside_outline_count": outside.len(),
         "outside_outline": outside.iter().take(top).collect::<Vec<_>>(),
         "airwires": {
@@ -761,6 +770,34 @@ mod tests {
             .map(|(a, b)| distance(refs[*a].at, refs[*b].at))
             .sum();
         assert!((total - 30.0).abs() < 1e-9, "{total}");
+    }
+
+    /// An outline drawn as Edge.Cuts inside a footprint is reported (#27);
+    /// the KiCad-authored fixture's outline spans (30, 50)..(170, 150).
+    #[tokio::test]
+    async fn a_footprint_owned_outline_is_reported() {
+        let board = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../copperpour-sexp/tests/fixtures/footprint_outline/footprint_outline_front.kicad_pcb"
+        );
+        let ctx = ToolContext::new(
+            crate::tools::ServerConfig::default(),
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+        let result = handle_placement_overview(&json!({ "board": board }), &ctx)
+            .await
+            .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text content");
+        };
+        let report: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(report["outline_source"], "footprint", "{report}");
+        assert_eq!(
+            report["outline_bbox"],
+            json!({ "x_min": 30.0, "y_min": 50.0, "x_max": 170.0, "y_max": 150.0 })
+        );
+        assert_eq!(report["outside_outline_count"], 0);
     }
 
     #[test]
