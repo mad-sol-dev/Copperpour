@@ -54,9 +54,21 @@ impl McpProcess {
         isolate_home: bool,
         env: &[(&str, &str)],
     ) -> Self {
+        Self::spawn_with_env_without(dir, isolate_home, env, &[])
+    }
+
+    fn spawn_with_env_without(
+        dir: Option<&std::path::Path>,
+        isolate_home: bool,
+        env: &[(&str, &str)],
+        removed_env: &[&str],
+    ) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_copperpour"));
         for (key, value) in env {
             command.env(key, value);
+        }
+        for name in removed_env {
+            command.env_remove(name);
         }
         if let Some(dir) = dir {
             command.current_dir(dir);
@@ -620,47 +632,149 @@ fn a_kicad_cli_in_the_working_directory_does_not_stop_discovery() {
     );
 }
 
-/// A `schematic-viewer` in the working directory was returned as the bare
-/// relative name, which the spawn then looked up on `PATH`, so the response
-/// named a binary other than the one launched (#184). A script stands in for
-/// the viewer, so this runs on Unix only.
+/// The browser default does not discover or launch a Tauri executable. Verify
+/// the default opener, headless reuse and failed opener through real stdio MCP.
 #[cfg(unix)]
 #[test]
-fn a_viewer_in_the_working_directory_is_not_reported_as_launched() {
-    use std::os::unix::fs::PermissionsExt;
+fn browser_viewer_stdio_reports_service_and_opener_separately() {
+    browser_viewer_stdio_case(false);
+}
 
+#[cfg(unix)]
+#[test]
+#[ignore = "requires kicad-cli; renders only a disposable fixture without a display session"]
+fn browser_viewer_stdio_native_without_display_serves_svg_despite_opener_failure() {
+    browser_viewer_stdio_case(true);
+}
+
+#[cfg(unix)]
+fn browser_viewer_stdio_case(native_cli: bool) {
+    use std::os::unix::fs::PermissionsExt;
     let tmp = tempfile::tempdir().unwrap();
     let bin = tmp.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
-    std::fs::write(tmp.path().join("schematic-viewer"), "").unwrap();
-    let viewer = bin.join("schematic-viewer");
-    // The server runs with the PATH below, so take `sleep`'s full path from
-    // this process's; the Nix build sandbox has no /bin or /usr/bin.
-    let sleep = std::env::split_paths(&std::env::var_os("PATH").unwrap())
-        .map(|dir| dir.join("sleep"))
-        .find(|path| path.is_file())
-        .expect("sleep on PATH");
-    std::fs::write(&viewer, format!("#!/bin/sh\nexec {} 3\n", sleep.display())).unwrap();
-    std::fs::set_permissions(&viewer, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let schematic = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../copperpour-core/tests/fixtures/derived_lib_name.kicad_sch"
+    let executable = |name: &str| {
+        std::env::split_paths(&std::env::var_os("PATH").unwrap())
+            .map(|dir| dir.join(name))
+            .find(|path| path.is_file())
+            .unwrap()
+    };
+    let shell = executable("sh");
+    let mkdir = executable("mkdir");
+    let cli = bin.join("cli");
+    std::fs::write(&cli, format!("#!{}\n{} -p \"$5\"\nprintf '<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 10 10\"><text>saved</text></svg>' > \"$5/root.svg\"\n", shell.display(), mkdir.display())).unwrap();
+    std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o700)).unwrap();
+    #[cfg(not(target_os = "macos"))]
+    let opener = bin.join("xdg-open");
+    // macOS uses `open`; Windows uses rundll32 and is tested separately.
+    #[cfg(target_os = "macos")]
+    let opener = bin.join("open");
+    std::fs::write(
+        &opener,
+        format!(
+            "#!{}\nprintf '%s' \"$1\" > \"$0.called\"\nprintf 'garbage-on-stdout\\n'\n",
+            shell.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&opener, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(
+        tmp.path().join("schematic-viewer"),
+        "must never be launched",
+    )
+    .unwrap();
+    let schematic = tmp.path().join("root.kicad_sch");
+    std::fs::copy(
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../copperpour-core/tests/fixtures/derived_lib_name.kicad_sch"
+        ),
+        &schematic,
+    )
+    .unwrap();
+    let cli = if native_cli {
+        std::env::var_os("COPPERPOUR_TEST_KICAD_CLI")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| executable("kicad-cli"))
+    } else {
+        cli
+    };
+    std::fs::write(
+        tmp.path().join("copperpour.toml"),
+        format!(
+            "kicad_cli = {}\n",
+            serde_json::to_string(cli.to_str().unwrap()).unwrap()
+        ),
+    )
+    .unwrap();
+    let mut paths = vec![bin.clone()];
+    paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+    let path = std::env::join_paths(paths).unwrap();
+    // The MCP client need not inherit a desktop session (#373).
+    let mut p = McpProcess::spawn_with_env_without(
+        Some(tmp.path()),
+        true,
+        &[("PATH", path.to_str().unwrap())],
+        &["DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR"],
     );
-
-    // A viewer built into this target directory would be found first.
-    let server = std::path::Path::new(env!("CARGO_BIN_EXE_copperpour"));
-    assert!(
-        !server.with_file_name("schematic-viewer").exists(),
-        "a schematic-viewer next to {} shadows the PATH lookup",
-        server.display()
-    );
-    let mut p = spawn_with_path_to(tmp.path(), &bin);
-    let result = p.call_tool("open_schematic_viewer", json!({"schematic": schematic}));
-    assert_ne!(result["isError"], json!(true), "{result:#?}");
+    let first = p.call_tool("open_schematic_viewer", json!({"schematic":schematic}));
+    assert_ne!(first["isError"], true, "{first}");
+    let first = McpProcess::tool_body(&first);
+    assert_eq!(first["viewer"], "browser");
+    assert_eq!(first["launched"], true);
+    assert_eq!(first["browser_launch_requested"], true);
+    assert_eq!(first["browser_launch_succeeded"], true);
     assert_eq!(
-        McpProcess::tool_body(&result)["viewer"],
-        viewer.to_str().unwrap()
+        std::fs::read_to_string(opener.with_file_name(format!(
+            "{}.called",
+            opener.file_name().unwrap().to_str().unwrap()
+        )))
+        .unwrap(),
+        first["url"].as_str().unwrap()
     );
+    let headless = p.call_tool(
+        "open_schematic_viewer",
+        json!({"schematic":schematic,"open_browser":false}),
+    );
+    let headless = McpProcess::tool_body(&headless);
+    assert_eq!(headless["url"], first["url"]);
+    assert_eq!(headless["reused"], true);
+    assert_eq!(headless["browser_launch_requested"], false);
+    assert_eq!(headless["browser_launch_succeeded"], false);
+    let assert_served = |url: &str| {
+        use std::io::Read;
+        let (base, token) = url.split_once("/#token=").unwrap();
+        let address = base.strip_prefix("http://").unwrap();
+        let sheet = format!(
+            "/sheet?file={}",
+            schematic.canonicalize().unwrap().display()
+        );
+        for (target, expected) in [("/state", "root.kicad_sch"), (sheet.as_str(), "<svg")] {
+            let mut stream = std::net::TcpStream::connect(address).unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                .unwrap();
+            write!(stream, "GET {target} HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n").unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+            assert!(response.contains(expected), "expected {expected}");
+        }
+    };
+    assert_served(headless["url"].as_str().unwrap());
+    std::fs::write(&opener, format!("#!{}\nexit 7\n", shell.display())).unwrap();
+    let failed = p.call_tool("open_schematic_viewer", json!({"schematic":schematic}));
+    assert_ne!(failed["isError"], true, "{failed}");
+    let failed = McpProcess::tool_body(&failed);
+    assert_eq!(failed["url"], first["url"]);
+    assert_eq!(failed["launched"], true);
+    assert_eq!(failed["browser_launch_requested"], true);
+    assert_eq!(failed["browser_launch_succeeded"], false);
+    assert!(failed["browser_launch_error"]
+        .as_str()
+        .unwrap()
+        .contains('7'));
+    assert_served(failed["url"].as_str().unwrap());
 }
 
 #[test]
@@ -878,11 +992,16 @@ fn a_legacy_guidance_marker_is_reported_on_the_first_start_only() {
     let mut p = McpProcess::spawn_configured(Some(tmp.path()), true);
     let instructions = p.initialized["result"]["instructions"].as_str().unwrap();
     assert!(
-        instructions.starts_with("Copperpour Claude guidance (installed by v0.2.2)"),
+        instructions.starts_with("Copperpour operating rules for KiCad work:")
+            && instructions.contains("Copperpour Claude guidance (installed by v0.2.2)"),
         "{instructions}"
     );
     assert!(instructions.contains("`copperpour init`"), "{instructions}");
-    assert_eq!(instructions.lines().count(), 1, "Codex was never installed");
+    assert_eq!(instructions.matches("installed by v0.2.2").count(), 1);
+    assert!(
+        !instructions.contains("Copperpour Codex guidance"),
+        "Codex was never installed"
+    );
 
     let result = p.call_tool("get_installation_info", json!({}));
     let body = McpProcess::tool_body(&result);
@@ -901,7 +1020,10 @@ fn a_legacy_guidance_marker_is_reported_on_the_first_start_only() {
 
     let mut p = McpProcess::spawn_configured(Some(tmp.path()), true);
     let init = &p.initialized["result"];
-    assert!(init.get("instructions").is_none(), "{init}");
+    assert_eq!(
+        init["instructions"],
+        copperpour_core::guidance::SESSION_RULES
+    );
     let result = p.call_tool("get_installation_info", json!({}));
     let guidance = &McpProcess::tool_body(&result)["guidance"];
     assert_eq!(guidance["claude"]["state"], "out_of_sync");
@@ -1184,4 +1306,33 @@ fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
         }
     }
     files
+}
+
+/// PCM/MCP registration alone exposes bundled guidance; no native skill install.
+#[cfg(unix)]
+#[test]
+fn server_guidance_works_over_stdio_without_init_or_profile_skill_writes() {
+    let profile = tempfile::tempdir().unwrap();
+    let mut process = McpProcess::spawn_configured(Some(profile.path()), true);
+    let init = &process.initialized["result"];
+    assert!(init["instructions"]
+        .as_str()
+        .unwrap()
+        .contains("Never hand-edit"));
+    assert_eq!(init["capabilities"]["resources"], json!({}));
+    let listed = McpProcess::tool_body(&process.call_tool("get_guidance", json!({})));
+    assert_eq!(listed["count"], 16);
+    let uri = "copperpour://guidance/copperpour/references/reliability-contract.md";
+    let resource = process.request("resources/read", json!({"uri":uri}));
+    let tool = McpProcess::tool_body(&process.call_tool(
+        "get_guidance",
+        json!({"path":"copperpour/references/reliability-contract.md"}),
+    ));
+    assert_eq!(resource["result"], tool);
+    assert_eq!(
+        tool["contents"][0]["text"],
+        include_str!("../../../docs/RELIABILITY_CONTRACT.md")
+    );
+    assert!(!profile.path().join(".claude").exists());
+    assert!(!profile.path().join(".agents").exists());
 }

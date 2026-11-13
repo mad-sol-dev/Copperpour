@@ -19,6 +19,9 @@ use std::path::Path;
 
 const UM_PER_MM: f64 = 1_000.0;
 const DSN_RESOLUTION: f32 = 10.0;
+const DEFAULT_OUTLINE_ARC_ERROR_UM: f64 = 5.0;
+const MAX_OUTLINE_ARC_SEGMENTS: usize = 1_000_000;
+const I64_UPPER_EXCLUSIVE: f64 = 9_223_372_036_854_775_808.0;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ExportBundle {
@@ -29,6 +32,13 @@ pub(crate) struct ExportBundle {
     pub pad_count: usize,
     pub net_count: usize,
     pub class_count: usize,
+    /// Copper layers of the exported board, counted from its layer table.
+    pub copper_layer_count: usize,
+    /// Copper zones of the exported board, each written as one `plane` per
+    /// copper layer it covers.
+    pub copper_zone_count: usize,
+    /// The sides the exported footprints sit on: `front`, `back` or `both`.
+    pub component_side: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
@@ -76,8 +86,42 @@ struct FootprintModel {
     image_name: String,
     x_um: i64,
     y_um: i64,
+    /// The `place` rotation: KiCad's for a front footprint, KiCad's plus 180
+    /// for a bottom one, as KiCad's own Specctra export writes it.
     rotation_degrees: f64,
+    side: Side,
     pads: Vec<PadModel>,
+    /// Pads on no copper layer, such as the paste apertures of a QFN's
+    /// exposed pad. KiCad's Specctra export leaves them out of the image, and
+    /// so does this one; the manifest still lists them (#458).
+    non_copper_pads: Vec<NonCopperPadModel>,
+}
+
+/// A pad on no copper layer: not routed, but part of the footprint the
+/// manifest is checked against (#458).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct NonCopperPadModel {
+    /// KiCad's pad number, often empty for a paste aperture.
+    number: String,
+    uuid: String,
+    /// Its KiCad layers, all technical (`F.Paste`, `B.Mask`, ...).
+    layers: Vec<String>,
+}
+
+/// The board side a footprint sits on, by its `F.Cu` or `B.Cu` layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Front,
+    Back,
+}
+
+impl Side {
+    fn name(self) -> &'static str {
+        match self {
+            Side::Front => "front",
+            Side::Back => "back",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -100,6 +144,16 @@ struct LockedViaModel {
     net: String,
 }
 
+/// One copper zone of the board: its net, the copper layers it covers (top to
+/// bottom) and its outline, in DSN micrometres. Its fill is not exported: like
+/// KiCad's own exporter, the DSN gives Freerouting the outline as a `plane`.
+#[derive(Debug, Clone)]
+struct CopperZoneModel {
+    net: String,
+    layers: Vec<String>,
+    outline: Vec<(i64, i64)>,
+}
+
 #[derive(Debug, Clone, Default)]
 struct LockedRouting {
     tracks: Vec<LockedTrackModel>,
@@ -118,7 +172,9 @@ type RuleGroups = BTreeMap<RuleKey, Vec<String>>;
 type NetClassNames = BTreeMap<String, String>;
 
 /// 2 adds each pin's `pad_uuid` and lets pads share a number (#338).
-pub(crate) const MANIFEST_SCHEMA_VERSION: u32 = 2;
+/// 3 adds the copper-zone inventory, `zones` (#430).
+/// 4 adds each component's pads on no copper layer, `non_copper_pads` (#458).
+pub(crate) const MANIFEST_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Deserialize, Serialize)]
 struct Manifest {
@@ -132,6 +188,18 @@ struct Manifest {
     components: Vec<ManifestComponent>,
     nets: Vec<ManifestNet>,
     padstacks: Vec<ManifestPadstack>,
+    /// Absent before schema 3, which had no copper zones (#430).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    zones: Vec<ManifestZoneCount>,
+}
+
+/// How many copper zones of one net cover one copper layer.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ManifestZoneCount {
+    pub layer: String,
+    pub net: String,
+    pub count: usize,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -166,6 +234,18 @@ struct ManifestComponent {
     rotation_degrees: f64,
     side: String,
     pads: Vec<ManifestPin>,
+    /// Pads on no copper layer: not in the DSN, checked against the live
+    /// board on import. Absent before schema 4 (#458).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    non_copper_pads: Vec<ManifestNonCopperPad>,
+}
+
+/// A pad on no copper layer, recorded but not routed (#458).
+#[derive(Debug, Deserialize, Serialize)]
+struct ManifestNonCopperPad {
+    pad_number: String,
+    pad_uuid: String,
+    layers: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -211,10 +291,12 @@ pub(crate) fn export_dsn(
     }
 
     let copper_layers = copper_layers(&tree)?;
-    let outline = simple_closed_outline(&tree)?;
+    let power_layers = power_layers(&tree);
+    let outline = simple_closed_outline(&tree, outline_arc_error_um(board_path, &tree)?)?;
     let net_table = top_level_net_table(&tree);
     let locked_routing = locked_routing(&tree, &net_table, &copper_layers)?;
-    let footprints = footprints(&tree, &net_table)?;
+    let zones = copper_zones(&tree, &net_table, &copper_layers)?;
+    let footprints = footprints(&tree, &net_table, &copper_layers)?;
     if footprints.is_empty() {
         bail!("supported routing profile requires at least one footprint");
     }
@@ -236,6 +318,13 @@ pub(crate) fn export_dsn(
     for pins in net_pins.values_mut() {
         pins.sort();
         pins.dedup();
+    }
+    // A plane names a DSN net, and the DSN only has nets with pads.
+    if let Some(zone) = zones.iter().find(|zone| !net_pins.contains_key(&zone.net)) {
+        bail!(
+            "unsupported routing profile: copper zone on net '{}', which has no pad",
+            zone.net
+        );
     }
 
     let (class_nets, net_classes) = normalize_rules(&net_pins, effective_rules)?;
@@ -262,6 +351,7 @@ pub(crate) fn export_dsn(
     let pcb = build_pcb(
         board_path,
         &copper_layers,
+        &power_layers,
         &outline,
         &footprints,
         &net_pins,
@@ -270,6 +360,7 @@ pub(crate) fn export_dsn(
         &padstack_names,
         &via_names,
         &locked_routing,
+        &zones,
     )?;
     let dsn = serialize_and_validate(pcb)?;
     let source_sha256 = sha256_hex(board_source.as_bytes());
@@ -283,6 +374,7 @@ pub(crate) fn export_dsn(
         &padstack_names,
         &via_names,
         &locked_routing,
+        &zones,
     )?;
 
     Ok(ExportBundle {
@@ -296,6 +388,9 @@ pub(crate) fn export_dsn(
             .sum(),
         net_count: net_pins.len(),
         class_count: class_nets.len(),
+        copper_layer_count: copper_layers.len(),
+        copper_zone_count: zones.len(),
+        component_side: component_side(&footprints),
     })
 }
 
@@ -341,7 +436,11 @@ pub(crate) fn adopt_native_dsn(
         .collect();
     let padstack_names =
         correlate_components(&baseline_identity, &native_identity, &roundrect_models)?;
+    refuse_merged_padstacks(&manifest, &padstack_names)?;
     validate_native_nets(&baseline_identity, &native_identity)?;
+    if baseline_identity.planes != native_identity.planes {
+        bail!("native DSN changed the copper-zone planes");
+    }
 
     for layer in &mut manifest.layers {
         layer.dsn_name = layer_names
@@ -464,11 +563,19 @@ enum DsnShapeIdentity {
 #[derive(Debug, Clone)]
 struct DsnIdentity {
     layers: BTreeMap<usize, String>,
+    /// Each layer's `(type …)`, by index.
+    layer_types: BTreeMap<usize, String>,
     components: BTreeMap<String, DsnPlacementIdentity>,
     nets: BTreeMap<String, BTreeSet<String>>,
     classes: BTreeMap<String, DsnClassIdentity>,
     padstacks: BTreeMap<String, Vec<DsnShapeIdentity>>,
+    /// Every `plane`, sorted: the two exporters need not list them in the
+    /// same order.
+    planes: Vec<DsnPlaneIdentity>,
 }
+
+/// `(net, layer, closed outline)` of one DSN `plane`.
+type DsnPlaneIdentity = (String, String, Vec<(i64, i64)>);
 
 fn validate_dsn_syntax(source: &str, label: &str) -> Result<()> {
     let cursor = Cursor::new(source.as_bytes());
@@ -494,6 +601,7 @@ fn dsn_identity(root: &SexpNode) -> Result<DsnIdentity> {
     }
     let structure = root.find("structure").context("DSN has no structure")?;
     let mut layers = BTreeMap::new();
+    let mut layer_types = BTreeMap::new();
     for layer in structure.find_all("layer") {
         let name = dsn_atom(layer, 1, "layer name")?.to_string();
         let index = layer
@@ -504,10 +612,45 @@ fn dsn_identity(root: &SexpNode) -> Result<DsnIdentity> {
             .context("DSN layer has no index")?
             .parse::<usize>()
             .context("DSN layer index is not an integer")?;
+        let kind = layer
+            .find("type")
+            .and_then(|kind| kind.get(1))
+            .and_then(SexpNode::as_str)
+            .context("DSN layer has no type")?
+            .to_string();
         if layers.insert(index, name).is_some() {
             bail!("DSN repeats a layer index");
         }
+        layer_types.insert(index, kind);
     }
+    let mut planes = Vec::new();
+    for plane in structure.find_all("plane") {
+        let net = dsn_atom(plane, 1, "plane net")?.to_string();
+        // `(plane <net> (polygon <layer> 0 x y ...))`; a `window` (a cutout) or
+        // any other shape is not a plane the export writes.
+        let children = plane.children().map_or(0, <[SexpNode]>::len);
+        let polygon = plane
+            .get(2)
+            .filter(|polygon| polygon.head() == Some("polygon") && children == 3)
+            .with_context(|| format!("DSN plane on net '{net}' is not one polygon"))?;
+        let DsnShapeIdentity::Polygon { layer, points } = dsn_polygon(polygon)? else {
+            unreachable!("dsn_polygon returns a polygon");
+        };
+        let points = points
+            .iter()
+            .map(|(x, y)| {
+                let integer = |value: OrderedF64| {
+                    let value = value.value();
+                    (value.fract() == 0.0 && value.abs() < I64_UPPER_EXCLUSIVE)
+                        .then_some(value as i64)
+                        .context("DSN plane coordinate is not a supported integer")
+                };
+                Ok((integer(*x)?, integer(*y)?))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        planes.push((net, layer, points));
+    }
+    planes.sort();
 
     let library = root.find("library").context("DSN has no library")?;
     let mut image_pins = BTreeMap::<String, BTreeMap<String, DsnPinIdentity>>::new();
@@ -666,10 +809,12 @@ fn dsn_identity(root: &SexpNode) -> Result<DsnIdentity> {
     }
     Ok(DsnIdentity {
         layers,
+        layer_types,
         components,
         nets,
         classes,
         padstacks,
+        planes,
     })
 }
 
@@ -693,6 +838,9 @@ fn correlate_layers(
         .collect::<Result<BTreeMap<_, _>>>()?;
     if mappings.iter().any(|(baseline, native)| baseline != native) {
         bail!("native DSN renamed a KiCad copper layer");
+    }
+    if baseline.layer_types != native.layer_types {
+        bail!("native DSN changed a copper layer's signal or power type");
     }
     Ok(mappings)
 }
@@ -763,6 +911,54 @@ fn correlate_components(
         }
     }
     Ok(padstacks)
+}
+
+/// KiCad names a pad's padstack after its copper only, so two pads that share
+/// a shape but not a drill get one native padstack. The reverse manifest would
+/// then hold that name twice, and the importer refuses such a manifest only
+/// after routing. Refuse the adoption instead, naming the pads on each side.
+fn refuse_merged_padstacks(
+    manifest: &Manifest,
+    padstack_names: &BTreeMap<String, String>,
+) -> Result<()> {
+    let mut by_native: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (baseline, native) in padstack_names {
+        by_native.entry(native).or_default().push(baseline);
+    }
+    let Some((native, merged)) = by_native.iter().find(|(_, merged)| merged.len() > 1) else {
+        return Ok(());
+    };
+    let sides = merged
+        .iter()
+        .map(|baseline| {
+            let pads = manifest
+                .components
+                .iter()
+                .flat_map(|component| {
+                    component
+                        .pads
+                        .iter()
+                        .filter(|pin| pin.padstack_name == *baseline)
+                        .map(move |pin| format!("{}-{}", component.reference, pin.pad_number))
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let drill = match manifest
+                .padstacks
+                .iter()
+                .find(|padstack| padstack.name == *baseline)
+                .and_then(|padstack| padstack.drill_um)
+            {
+                Some(drill_um) => format!("drill {drill_um} um"),
+                None => "no drill".to_string(),
+            };
+            format!("{pads} ({drill})")
+        })
+        .collect::<Vec<_>>()
+        .join(" and ");
+    bail!(
+        "KiCad native DSN gives one padstack '{native}' to pads that the Rust export keeps apart: {sides}"
+    );
 }
 
 /// A rounded rectangle is judged against its pad; every other shape must be
@@ -985,12 +1181,6 @@ fn locked_routing(
     net_table: &BTreeMap<String, String>,
     copper_layers: &[String],
 ) -> Result<LockedRouting> {
-    let zone_count = tree.find_all("zone").len();
-    if zone_count > 0 {
-        bail!(
-            "unsupported first routing profile: board contains {zone_count} copper zone or rule area(s)"
-        );
-    }
     let arc_count = tree.find_all("arc").len();
     if arc_count > 0 {
         let locked = tree
@@ -1058,11 +1248,17 @@ fn locked_routing(
             .filter_map(SexpNode::as_str)
             .map(str::to_string)
             .collect::<Vec<_>>();
-        if layers != copper_layers {
+        // KiCad writes a through via's span as its two outer layers, on any
+        // number of copper layers.
+        let through = [
+            copper_layers[0].clone(),
+            copper_layers[copper_layers.len() - 1].clone(),
+        ];
+        if layers != through {
             bail!(
                 "unsupported locked via layer span [{}]; expected [{}]",
                 layers.join(", "),
-                copper_layers.join(", ")
+                through.join(", ")
             );
         }
         let net = via
@@ -1122,31 +1318,231 @@ fn locked_routing(
     Ok(routing)
 }
 
+/// The board's copper zones (#430). Each one is exported as its outline, one
+/// `plane` per copper layer it covers, as KiCad's own exporter writes it; what
+/// that cannot say exactly is refused: a rule area (keep-outs stay with #81),
+/// a zone without a net (KiCad would invent a net for it), an outline with a
+/// cutout (a `window` in the DSN), a zone off the copper stack, and a zone
+/// inside a footprint.
+fn copper_zones(
+    tree: &SexpNode,
+    net_table: &BTreeMap<String, String>,
+    copper_layers: &[String],
+) -> Result<Vec<CopperZoneModel>> {
+    for footprint in tree.find_all("footprint") {
+        if !footprint.find_all("zone").is_empty() {
+            let reference = property_value(footprint, "Reference").unwrap_or("?");
+            bail!("unsupported routing profile: footprint {reference} contains a zone");
+        }
+    }
+    let mut zones = Vec::new();
+    for zone in tree.find_all("zone") {
+        let name = zone.find_str("name").unwrap_or("");
+        let label = if name.is_empty() {
+            "copper zone".to_string()
+        } else {
+            format!("copper zone '{name}'")
+        };
+        if zone.find("keepout").is_some() || zone.find("placement").is_some() {
+            bail!("unsupported routing profile: board contains a rule area, which this exporter does not write as a keep-out");
+        }
+        let named = match (zone.find("layer"), zone.find("layers")) {
+            (Some(layer), None) => layer
+                .get(1)
+                .and_then(SexpNode::as_str)
+                .map(|name| vec![name.to_string()])
+                .unwrap_or_default(),
+            (None, Some(layers)) => layers
+                .children()
+                .unwrap_or(&[])
+                .iter()
+                .skip(1)
+                .filter_map(SexpNode::as_str)
+                .map(str::to_string)
+                .collect(),
+            _ => Vec::new(),
+        };
+        if named.is_empty() {
+            bail!("{label} has no layer");
+        }
+        let covered = if named == ["*.Cu"] {
+            copper_layers.to_vec()
+        } else {
+            if let Some(layer) = named.iter().find(|name| !copper_layers.contains(name)) {
+                bail!("unsupported routing profile: {label} is on '{layer}', which is not a copper layer of the board");
+            }
+            if named.iter().collect::<BTreeSet<_>>().len() != named.len() {
+                bail!("{label} repeats a layer");
+            }
+            copper_layers
+                .iter()
+                .filter(|layer| named.contains(layer))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let net = zone
+            .find("net")
+            .and_then(|node| resolve_net(node, net_table))
+            .with_context(|| {
+                format!("unsupported routing profile: {label} has no net, which KiCad exports under an invented net name")
+            })?;
+        let polygons = zone.find_all("polygon");
+        if polygons.len() != 1 {
+            bail!(
+                "unsupported routing profile: {label} on net '{net}' has {} outlines; an outline with a cutout is not exported",
+                polygons.len()
+            );
+        }
+        let points = polygons[0]
+            .find("pts")
+            .and_then(SexpNode::children)
+            .with_context(|| format!("{label} outline has no points"))?;
+        let mut outline = Vec::with_capacity(points.len());
+        for point in points.iter().skip(1) {
+            if point.head() != Some("xy") {
+                bail!(
+                    "unsupported routing profile: {label} outline has a '{}' point; only straight edges are exported",
+                    point.head().unwrap_or("?")
+                );
+            }
+            let x = finite_um(point.get_f64(1), "zone x")?;
+            let y = finite_um(point.get_f64(2), "zone y")?
+                .checked_neg()
+                .context("zone y is outside the supported coordinate range")?;
+            outline.push((x, y));
+        }
+        if outline.iter().collect::<BTreeSet<_>>().len() < 3 {
+            bail!("{label} outline has fewer than three distinct points");
+        }
+        zones.push(CopperZoneModel {
+            net,
+            layers: covered,
+            outline,
+        });
+    }
+    Ok(zones)
+}
+
+/// How many copper zones of each net cover each copper layer of the board,
+/// sorted by layer then net: the inventory the manifest records.
+fn zone_inventory(zones: &[CopperZoneModel]) -> Vec<ManifestZoneCount> {
+    let mut counts = BTreeMap::<(&str, &str), usize>::new();
+    for zone in zones {
+        for layer in &zone.layers {
+            *counts
+                .entry((layer.as_str(), zone.net.as_str()))
+                .or_default() += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .map(|((layer, net), count)| ManifestZoneCount {
+            layer: layer.to_string(),
+            net: net.to_string(),
+            count,
+        })
+        .collect()
+}
+
+/// The copper-zone inventory of a live board, read the way the export reads it.
+pub(crate) fn board_zone_inventory(board_source: &str) -> Result<Vec<ManifestZoneCount>> {
+    let tree = parse_sexp(board_source).context("parse KiCad board for its copper zones")?;
+    let copper_layers = copper_layers(&tree)?;
+    let zones = copper_zones(&tree, &top_level_net_table(&tree), &copper_layers)?;
+    Ok(zone_inventory(&zones))
+}
+
+/// The board's copper layers from top to bottom: `F.Cu`, `In1.Cu`..`In<N-2>.Cu`
+/// and `B.Cu`, the order Specctra layer indices follow. KiCad 10 writes the
+/// layer table top to bottom (`F.Cu` 0, `In1.Cu` 4, `In2.Cu` 6, `B.Cu` 2) but
+/// writes a pad's layer list by ordinal (`F.Cu`, `B.Cu`, `In2.Cu`), so the
+/// order is rebuilt from the names rather than taken from either list; a set
+/// with a gap, a repeat or a missing outer layer is refused.
 fn copper_layers(tree: &SexpNode) -> Result<Vec<String>> {
-    let layers = tree.find("layers").context("board has no layers table")?;
-    let mut copper = layers
+    let table = tree.find("layers").context("board has no layers table")?;
+    let copper = copperpour_sexp::layers::table_layers(table)
+        .into_iter()
+        .filter(copperpour_sexp::layers::Layer::is_copper)
+        .map(|layer| layer.name)
+        .collect::<Vec<_>>();
+    let distinct = copper.iter().collect::<BTreeSet<_>>();
+    let stack = copperpour_sexp::layers::CopperStack::from_layer_names(
+        copper.iter().map(String::as_str),
+    )
+    .ok()
+    .filter(|_| distinct.len() == copper.len())
+    .with_context(|| {
+        format!(
+            "unsupported routing profile: copper layers must be F.Cu, In1.Cu..In<N-2>.Cu and B.Cu, got [{}]",
+            copper.join(", ")
+        )
+    })?;
+    Ok(stack_layer_names(stack.count()))
+}
+
+/// The copper layers the board's layer table marks `power`. KiCad's exporter
+/// writes them as DSN `power` layers, where Freerouting lays no track, and
+/// every other copper layer (`signal`, `mixed`, `jumper`) as `signal`.
+fn power_layers(tree: &SexpNode) -> BTreeSet<String> {
+    tree.find("layers")
+        .map(copperpour_sexp::layers::table_layers)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|layer| layer.is_copper() && layer.kind == "power")
+        .map(|layer| layer.name)
+        .collect()
+}
+
+/// `F.Cu`, `In1.Cu`..`In<count-2>.Cu`, `B.Cu`.
+pub(crate) fn stack_layer_names(count: u32) -> Vec<String> {
+    std::iter::once("F.Cu".to_string())
+        .chain((1..count.saturating_sub(1)).map(|k| format!("In{k}.Cu")))
+        .chain(std::iter::once("B.Cu".to_string()))
+        .collect()
+}
+
+fn outline_arc_error_um(board_path: &Path, tree: &SexpNode) -> Result<f64> {
+    if !tree
         .children()
         .unwrap_or(&[])
         .iter()
-        .skip(1)
-        // Layer table rows are `(numeric-id "name" type)`, so the layer name
-        // is the first data item even though the numeric id is the list head.
-        .filter_map(|layer| layer.get(1).and_then(SexpNode::as_str))
-        .filter(|name| name.ends_with(".Cu"))
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    copper.dedup();
-    if copper != ["F.Cu".to_string(), "B.Cu".to_string()] {
+        .any(|node| node.head() == Some("gr_arc") && node.find_str("layer") == Some("Edge.Cuts"))
+    {
+        return Ok(DEFAULT_OUTLINE_ARC_ERROR_UM);
+    }
+    let project_path = board_path.with_extension("kicad_pro");
+    let bytes = match std::fs::read(&project_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(DEFAULT_OUTLINE_ARC_ERROR_UM);
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("read project {}", project_path.display()));
+        }
+    };
+    let project: serde_json::Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse project {}", project_path.display()))?;
+    let Some(value) = project.pointer("/board/design_settings/rules/max_error") else {
+        return Ok(DEFAULT_OUTLINE_ARC_ERROR_UM);
+    };
+    let error_mm = value.as_f64().with_context(|| {
+        format!(
+            "project {} board.design_settings.rules.max_error is not a number",
+            project_path.display()
+        )
+    })?;
+    let error_um = error_mm * UM_PER_MM;
+    if !error_um.is_finite() || error_um <= 0.0 {
         bail!(
-            "unsupported first routing profile: expected exactly F.Cu and B.Cu, got [{}]",
-            copper.join(", ")
+            "project {} board.design_settings.rules.max_error must be a positive finite number",
+            project_path.display()
         );
     }
-    Ok(copper)
+    Ok(error_um)
 }
 
-fn simple_closed_outline(tree: &SexpNode) -> Result<Vec<(i64, i64)>> {
-    let mut edges = Vec::new();
+fn simple_closed_outline(tree: &SexpNode, max_error_um: f64) -> Result<Vec<(i64, i64)>> {
+    let mut edges: Vec<Vec<(i64, i64)>> = Vec::new();
     for node in tree.children().unwrap_or(&[]) {
         if node.find_str("layer") != Some("Edge.Cuts") {
             continue;
@@ -1158,67 +1554,203 @@ fn simple_closed_outline(tree: &SexpNode) -> Result<Vec<(i64, i64)>> {
                 if start == end {
                     bail!("unsupported outline: zero-length Edge.Cuts line");
                 }
-                edges.push((start, end));
+                edges.push(vec![start, end]);
+            }
+            Some("gr_arc") => {
+                let start = point_um_f64(node, "start").context("Edge.Cuts arc has no start")?;
+                let mid = point_um_f64(node, "mid").context("Edge.Cuts arc has no mid")?;
+                let end = point_um_f64(node, "end").context("Edge.Cuts arc has no end")?;
+                edges.push(outline_arc_points(start, mid, end, max_error_um)?);
             }
             Some(tag) if tag.starts_with("gr_") => {
-                bail!("unsupported first routing profile: Edge.Cuts '{tag}' is not a straight line")
+                bail!("unsupported first routing profile: Edge.Cuts '{tag}' is not a line or circular arc")
             }
             _ => {}
         }
     }
-    if edges.len() < 3 {
-        bail!("unsupported outline: need at least three Edge.Cuts lines");
+    // Two edges are enough for a D-shaped board (one line, one arc). A single
+    // edge fails the degree check below, and the enclosed-area check after the
+    // walk refuses two edges that only retrace each other.
+    if edges.is_empty() {
+        bail!("unsupported outline: no Edge.Cuts lines or arcs");
     }
 
-    let mut adjacency: BTreeMap<(i64, i64), Vec<(i64, i64)>> = BTreeMap::new();
-    for (start, end) in &edges {
-        adjacency.entry(*start).or_default().push(*end);
-        adjacency.entry(*end).or_default().push(*start);
+    // Stable edge order makes the chosen direction deterministic even when
+    // KiCad serializes the outline primitives in a different order.
+    edges.sort_by(|left, right| {
+        let canonical = |points: &[(i64, i64)]| {
+            let forward = points.to_vec();
+            let reverse = points.iter().rev().copied().collect::<Vec<_>>();
+            if forward <= reverse {
+                forward
+            } else {
+                reverse
+            }
+        };
+        canonical(left).cmp(&canonical(right))
+    });
+
+    let mut adjacency: BTreeMap<(i64, i64), Vec<usize>> = BTreeMap::new();
+    for (index, points) in edges.iter().enumerate() {
+        let start = *points.first().context("outline edge has no points")?;
+        let end = *points.last().context("outline edge has no points")?;
+        adjacency.entry(start).or_default().push(index);
+        adjacency.entry(end).or_default().push(index);
     }
-    for (point, neighbours) in &mut adjacency {
-        neighbours.sort();
-        neighbours.dedup();
-        if neighbours.len() != 2 {
+    for (point, incident_edges) in &mut adjacency {
+        incident_edges.sort_unstable();
+        if incident_edges.len() != 2 {
             bail!(
                 "unsupported outline: vertex ({}, {}) has degree {}, expected 2",
                 point.0,
                 point.1,
-                neighbours.len()
+                incident_edges.len()
             );
         }
     }
 
     let start = *adjacency.keys().next().context("outline has no vertices")?;
     let mut ordered = vec![start];
-    let mut previous = None;
     let mut current = start;
+    let mut used_edges = BTreeSet::new();
     loop {
-        let neighbours = &adjacency[&current];
-        let next = match previous {
-            None => neighbours[0],
-            Some(previous) if neighbours[0] == previous => neighbours[1],
-            Some(_) => neighbours[0],
+        let edge_index = adjacency[&current]
+            .iter()
+            .copied()
+            .find(|index| !used_edges.contains(index))
+            .context("unsupported outline: Edge.Cuts is not one closed loop")?;
+        used_edges.insert(edge_index);
+        let points = &edges[edge_index];
+        let directed = if points.first() == Some(&current) {
+            points.clone()
+        } else if points.last() == Some(&current) {
+            points.iter().rev().copied().collect()
+        } else {
+            bail!("unsupported outline: Edge.Cuts edge is disconnected");
         };
-        if next == start {
-            ordered.push(start);
+        ordered.extend(directed.into_iter().skip(1));
+        current = *ordered.last().context("outline has no points")?;
+        if current == start {
             break;
         }
-        if ordered.contains(&next) {
-            bail!("unsupported outline: Edge.Cuts contains more than one loop");
-        }
-        ordered.push(next);
-        previous = Some(current);
-        current = next;
     }
-    if ordered.len() != edges.len() + 1 {
-        bail!("unsupported outline: Edge.Cuts is not one closed loop");
+    if used_edges.len() != edges.len() {
+        bail!("unsupported outline: Edge.Cuts contains more than one loop");
+    }
+    // Two straight lines between the same two points, or one arc drawn twice,
+    // walk back over themselves: the loop is closed but encloses nothing.
+    if edges.len() == 2 {
+        let doubled_area: i128 = ordered
+            .windows(2)
+            .map(|edge| {
+                i128::from(edge[0].0) * i128::from(edge[1].1)
+                    - i128::from(edge[1].0) * i128::from(edge[0].1)
+            })
+            .sum();
+        if doubled_area == 0 {
+            bail!("unsupported outline: two Edge.Cuts edges enclose no area");
+        }
     }
     Ok(ordered)
+}
+
+/// Flatten a KiCad three-point arc into chords that stay within the board's
+/// `max_error`. A 0.707 µm allowance covers rounding the board's input points
+/// to the exporter’s micrometre coordinate grid.
+fn outline_arc_points(
+    start: (f64, f64),
+    mid: (f64, f64),
+    end: (f64, f64),
+    max_error_um: f64,
+) -> Result<Vec<(i64, i64)>> {
+    use std::f64::consts::{PI, TAU};
+
+    if start == end || start == mid || mid == end {
+        bail!("unsupported outline: Edge.Cuts arc has coincident points");
+    }
+    let (bx, by) = (mid.0 - start.0, mid.1 - start.1);
+    let (cx, cy) = (end.0 - start.0, end.1 - start.1);
+    let cross = bx * cy - by * cx;
+    let span = bx.hypot(by).max(cx.hypot(cy)).max((cx - bx).hypot(cy - by));
+    if !cross.is_finite() || cross.abs() <= f64::EPSILON * span * span * 16.0 {
+        bail!("unsupported outline: Edge.Cuts arc points are collinear");
+    }
+
+    // Circumcentre relative to start; using local coordinates avoids loss of
+    // precision for boards whose origin is far from the outline.
+    let b2 = bx * bx + by * by;
+    let c2 = cx * cx + cy * cy;
+    let ux = (cy * b2 - by * c2) / (2.0 * cross);
+    let uy = (bx * c2 - cx * b2) / (2.0 * cross);
+    let radius = ux.hypot(uy);
+    if !radius.is_finite() || radius <= 0.0 {
+        bail!("unsupported outline: Edge.Cuts arc has no finite radius");
+    }
+
+    let angle = |x: f64, y: f64| (y - uy).atan2(x - ux);
+    let start_angle = angle(0.0, 0.0);
+    let to_mid = (angle(bx, by) - start_angle).rem_euclid(TAU);
+    let to_end = (angle(cx, cy) - start_angle).rem_euclid(TAU);
+    let sweep = if to_mid <= to_end {
+        to_end
+    } else {
+        to_end - TAU
+    };
+    let chord_error_um = max_error_um - std::f64::consts::FRAC_1_SQRT_2;
+    if !chord_error_um.is_finite() || chord_error_um <= 0.0 {
+        bail!("unsupported outline: board max_error is smaller than the DSN coordinate resolution");
+    }
+    let max_step = if chord_error_um >= radius {
+        PI
+    } else {
+        2.0 * (1.0 - chord_error_um / radius).acos()
+    };
+    if !max_step.is_finite() || max_step <= 0.0 {
+        bail!("unsupported outline: board max_error cannot represent an Edge.Cuts arc");
+    }
+    let segment_count = (sweep.abs() / max_step).ceil().max(1.0) as usize;
+    if segment_count > MAX_OUTLINE_ARC_SEGMENTS {
+        bail!(
+            "unsupported outline: Edge.Cuts arc needs more than {MAX_OUTLINE_ARC_SEGMENTS} segments"
+        );
+    }
+
+    let mut points = Vec::with_capacity(segment_count + 1);
+    let start_point = (round_um_i64(start.0)?, round_um_i64(start.1)?);
+    let end_point = (round_um_i64(end.0)?, round_um_i64(end.1)?);
+    points.push(start_point);
+    for index in 1..segment_count {
+        let theta = start_angle + sweep * index as f64 / segment_count as f64;
+        let point = (
+            round_um_i64(start.0 + ux + radius * theta.cos())?,
+            round_um_i64(start.1 + uy + radius * theta.sin())?,
+        );
+        if points.last() != Some(&point) {
+            points.push(point);
+        }
+    }
+    if points.last() != Some(&end_point) {
+        points.push(end_point);
+    }
+    if points.len() < 2 {
+        bail!("unsupported outline: Edge.Cuts arc collapsed at DSN resolution");
+    }
+    Ok(points)
+}
+
+fn round_um_i64(value_um: f64) -> Result<i64> {
+    let rounded = value_um.round();
+    // `i64::MAX as f64` rounds up to 2^63, so the upper bound is exclusive.
+    if !rounded.is_finite() || rounded < i64::MIN as f64 || rounded >= I64_UPPER_EXCLUSIVE {
+        bail!("unsupported outline: flattened Edge.Cuts arc exceeds coordinate range");
+    }
+    Ok(rounded as i64)
 }
 
 fn footprints(
     tree: &SexpNode,
     net_table: &BTreeMap<String, String>,
+    copper_layers: &[String],
 ) -> Result<Vec<FootprintModel>> {
     // Across the board: a pad UUID names one physical pad.
     let mut pad_uuids = BTreeSet::new();
@@ -1228,9 +1760,11 @@ fn footprints(
         let layer = footprint
             .find_str("layer")
             .context("footprint has no layer")?;
-        if layer != "F.Cu" {
-            bail!("unsupported first routing profile: footprint on '{layer}'");
-        }
+        let side = match layer {
+            "F.Cu" => Side::Front,
+            "B.Cu" => Side::Back,
+            _ => bail!("unsupported first routing profile: footprint on '{layer}'"),
+        };
         if footprint.find("clearance").is_some() {
             bail!("unsupported first routing profile: footprint has a local clearance override");
         }
@@ -1249,10 +1783,52 @@ fn footprints(
         let x_um = finite_um(at.get_f64(1), "footprint x")?;
         let y_um = -finite_um(at.get_f64(2), "footprint y")?;
         let rotation_degrees = finite_number(at.get_f64(3).or(Some(0.0)), "footprint rotation")?;
+        // KiCad keeps a bottom footprint's pads mirrored about its local X
+        // axis, and its Specctra export unflips them: the image is the front
+        // one and the `place` is `back` at KiCad's rotation plus 180, which
+        // the router mirrors back about the image's Y axis.
+        let place_degrees = match side {
+            Side::Front => rotation_degrees,
+            Side::Back => pin_rotation(rotation_degrees + 180.0, 0.0),
+        };
         let image_name = format!("copperpour_image_{reference}");
 
         let mut pads = Vec::new();
+        let mut non_copper_pads = Vec::new();
         for pad in footprint.find_all("pad") {
+            // An SMD pad on no copper layer (a paste aperture) is not routed:
+            // KiCad's export skips it, and this one only records it (#458).
+            let pad_layers = pad
+                .find("layers")
+                .and_then(SexpNode::children)
+                .unwrap_or(&[])
+                .iter()
+                .skip(1)
+                .filter_map(SexpNode::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            if pad.get(2).and_then(SexpNode::as_str) == Some("smd")
+                && !pad_layers.is_empty()
+                && !pad_layers.iter().any(|layer| layer.ends_with(".Cu"))
+            {
+                let number = pad.get(1).and_then(SexpNode::as_str).unwrap_or("");
+                let uuid = pad
+                    .find_str("uuid")
+                    .filter(|uuid| !uuid.is_empty())
+                    .with_context(|| format!("pad on no copper layer of {reference} has no UUID"))?
+                    .to_string();
+                if !pad_uuids.insert(uuid.clone()) {
+                    bail!(
+                        "pad on no copper layer of {reference} repeats the UUID {uuid} of another pad"
+                    );
+                }
+                non_copper_pads.push(NonCopperPadModel {
+                    number: number.to_string(),
+                    uuid,
+                    layers: pad_layers,
+                });
+                continue;
+            }
             let number = pad
                 .get(1)
                 .and_then(SexpNode::as_str)
@@ -1291,11 +1867,13 @@ fn footprints(
             };
             let at = pad.find("at").context("pad has no position")?;
             let x_um = finite_um(at.get_f64(1), "pad x")?;
-            let y_um = -finite_um(at.get_f64(2), "pad y")?;
-            let pin_degrees = pin_rotation(
-                finite_number(at.get_f64(3).or(Some(0.0)), "pad rotation")?,
-                rotation_degrees,
-            );
+            let file_y_um = finite_um(at.get_f64(2), "pad y")?;
+            let pad_degrees = finite_number(at.get_f64(3).or(Some(0.0)), "pad rotation")?;
+            // Unflipped, a bottom pad's local Y and its turn change sign.
+            let (y_um, pin_degrees) = match side {
+                Side::Front => (-file_y_um, pin_rotation(pad_degrees, rotation_degrees)),
+                Side::Back => (file_y_um, pin_rotation(rotation_degrees, pad_degrees)),
+            };
             let size = pad.find("size").context("pad has no size")?;
             let size_x_um = positive_um(size.get_f64(1), "pad width")?;
             let size_y_um = positive_um(size.get_f64(2), "pad height")?;
@@ -1342,17 +1920,28 @@ fn footprints(
                 .map(str::to_string)
                 .collect::<Vec<_>>();
             let (layers, drill_um) = if pad_type == "smd" {
-                if layers != ["F.Cu".to_string()] {
+                // An SMD pad is on its footprint's side; the front image
+                // carries it on F.Cu, as KiCad's export writes it.
+                let own = match side {
+                    Side::Front => "F.Cu",
+                    Side::Back => "B.Cu",
+                };
+                if layers != [own.to_string()] {
                     bail!(
                         "unsupported SMD pad {reference}-{number}: copper layers are [{}]",
                         layers.join(", ")
                     );
                 }
-                (layers, None)
+                (vec!["F.Cu".to_string()], None)
             } else {
-                if !(layers == ["*.Cu".to_string()]
-                    || layers == ["F.Cu".to_string(), "B.Cu".to_string()])
-                {
+                // Every copper layer, as a wildcard or each listed once. KiCad
+                // saves a pad on every layer as `*.Cu`; a list written by hand
+                // or by another tool may follow the ordinal order of pad lists
+                // (`F.Cu`, `B.Cu`, `In1.Cu`, ...), so it is compared as a set.
+                let listed_in_full = layers.len() == copper_layers.len()
+                    && layers.iter().collect::<BTreeSet<_>>()
+                        == copper_layers.iter().collect::<BTreeSet<_>>();
+                if !(layers == ["*.Cu".to_string()] || listed_in_full) {
                     bail!(
                         "unsupported through-hole pad {reference}-{number}: copper layers are [{}]",
                         layers.join(", ")
@@ -1368,7 +1957,7 @@ fn footprints(
                         "pad {reference}-{number} drill {drill_um} um is not smaller than its copper size"
                     );
                 }
-                (vec!["F.Cu".to_string(), "B.Cu".to_string()], Some(drill_um))
+                (copper_layers.to_vec(), Some(drill_um))
             };
             let net = pad
                 .find("net")
@@ -1396,14 +1985,17 @@ fn footprints(
         }
         dsn_pin_names(&reference, &mut pads)?;
         pads.sort_by(|left, right| left.pin.cmp(&right.pin));
+        non_copper_pads.sort();
         output.push(FootprintModel {
             reference,
             kiid,
             image_name,
             x_um,
             y_um,
-            rotation_degrees,
+            rotation_degrees: place_degrees,
+            side,
             pads,
+            non_copper_pads,
         });
     }
     output.sort_by(|left, right| left.reference.cmp(&right.reference));
@@ -1420,14 +2012,30 @@ pub(crate) struct PinIdentity {
     pub net: Option<String>,
 }
 
-/// Every routed footprint's pins, by footprint UUID, named as [`export_dsn`]
-/// names them.
-pub(crate) fn board_pin_identities(
-    board_source: &str,
-) -> Result<BTreeMap<String, Vec<PinIdentity>>> {
+/// A pad on no copper layer as the manifest records it (#458).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct NonCopperPadIdentity {
+    pub pad_number: String,
+    pub pad_uuid: String,
+    pub layers: Vec<String>,
+}
+
+/// A routed footprint of the live board: the side it sits on, its pins, and
+/// its pads on no copper layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LiveFootprint {
+    pub side: &'static str,
+    pub pins: Vec<PinIdentity>,
+    pub non_copper_pads: Vec<NonCopperPadIdentity>,
+}
+
+/// Every routed footprint's side and pins, by footprint UUID, named as
+/// [`export_dsn`] names them.
+pub(crate) fn board_pin_identities(board_source: &str) -> Result<BTreeMap<String, LiveFootprint>> {
     let tree = parse_sexp(board_source).context("parse KiCad board snapshot")?;
     let net_table = top_level_net_table(&tree);
-    Ok(footprints(&tree, &net_table)?
+    let copper_layers = copper_layers(&tree)?;
+    Ok(footprints(&tree, &net_table, &copper_layers)?
         .into_iter()
         .map(|footprint| {
             let reference = footprint.reference;
@@ -1441,7 +2049,22 @@ pub(crate) fn board_pin_identities(
                     net: pad.net,
                 })
                 .collect();
-            (footprint.kiid, pins)
+            (
+                footprint.kiid,
+                LiveFootprint {
+                    side: footprint.side.name(),
+                    pins,
+                    non_copper_pads: footprint
+                        .non_copper_pads
+                        .into_iter()
+                        .map(|pad| NonCopperPadIdentity {
+                            pad_number: pad.number,
+                            pad_uuid: pad.uuid,
+                            layers: pad.layers,
+                        })
+                        .collect(),
+                },
+            )
         })
         .collect())
 }
@@ -1562,6 +2185,7 @@ fn normalize_rules(
 fn build_pcb(
     board_path: &Path,
     copper_layers: &[String],
+    power_layers: &BTreeSet<String>,
     outline: &[(i64, i64)],
     footprints: &[FootprintModel],
     net_pins: &BTreeMap<String, Vec<String>>,
@@ -1570,6 +2194,7 @@ fn build_pcb(
     padstack_names: &BTreeMap<PadstackKey, String>,
     via_names: &BTreeMap<RuleKey, String>,
     locked_routing: &LockedRouting,
+    zones: &[CopperZoneModel],
 ) -> Result<dsn::Pcb> {
     let default_rule = class_nets
         .keys()
@@ -1580,7 +2205,12 @@ fn build_pcb(
         .enumerate()
         .map(|(index, name)| dsn::Layer {
             name: name.clone(),
-            r#type: "signal".to_string(),
+            r#type: if power_layers.contains(name) {
+                "power"
+            } else {
+                "signal"
+            }
+            .to_string(),
             property: Some(dsn::Property { index }),
         })
         .collect();
@@ -1604,7 +2234,7 @@ fn build_pcb(
                 name: footprint.reference.clone(),
                 x: footprint.x_um as f64,
                 y: footprint.y_um as f64,
-                side: "front".to_string(),
+                side: footprint.side.name().to_string(),
                 rotation: footprint.rotation_degrees,
                 PN: None,
             }],
@@ -1760,7 +2390,28 @@ fn build_pcb(
             layers,
             boundary,
             place_boundary: None,
-            planes: Vec::new(),
+            planes: zones
+                .iter()
+                .flat_map(|zone| {
+                    zone.layers.iter().map(|layer| dsn::Plane {
+                        net: zone.net.clone(),
+                        polygon: dsn::Polygon {
+                            layer: layer.clone(),
+                            width: 0.0,
+                            // Closed, as KiCad writes it.
+                            coords: zone
+                                .outline
+                                .iter()
+                                .chain(zone.outline.first())
+                                .map(|(x, y)| dsn::Point {
+                                    x: *x as f64,
+                                    y: *y as f64,
+                                })
+                                .collect(),
+                        },
+                    })
+                })
+                .collect(),
             keepouts: dsn::Keepouts(Vec::new()),
             via: dsn::ViaNames {
                 names: via_names.values().cloned().collect(),
@@ -1912,6 +2563,22 @@ fn serialize_and_validate(pcb: dsn::Pcb) -> Result<String> {
     Ok(text)
 }
 
+/// The sides the board's footprints sit on, derived from them: `front`,
+/// `back`, or `both`, the words `export_position_file` uses.
+fn component_side(footprints: &[FootprintModel]) -> &'static str {
+    let front = footprints
+        .iter()
+        .any(|footprint| footprint.side == Side::Front);
+    let back = footprints
+        .iter()
+        .any(|footprint| footprint.side == Side::Back);
+    match (front, back) {
+        (true, true) => "both",
+        (false, true) => "back",
+        _ => "front",
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_manifest(
     board_path: &Path,
@@ -1923,6 +2590,7 @@ fn build_manifest(
     padstack_names: &BTreeMap<PadstackKey, String>,
     via_names: &BTreeMap<RuleKey, String>,
     locked_routing: &LockedRouting,
+    zones: &[CopperZoneModel],
 ) -> Result<String> {
     let components = footprints
         .iter()
@@ -1933,7 +2601,7 @@ fn build_manifest(
             x_um: footprint.x_um,
             y_um: footprint.y_um,
             rotation_degrees: footprint.rotation_degrees,
-            side: "front".to_string(),
+            side: footprint.side.name().to_string(),
             pads: footprint
                 .pads
                 .iter()
@@ -1943,6 +2611,15 @@ fn build_manifest(
                     dsn_pin: format!("{}-{}", footprint.reference, pad.pin),
                     net: pad.net.clone(),
                     padstack_name: padstack_names[&pad.padstack].clone(),
+                })
+                .collect(),
+            non_copper_pads: footprint
+                .non_copper_pads
+                .iter()
+                .map(|pad| ManifestNonCopperPad {
+                    pad_number: pad.number.clone(),
+                    pad_uuid: pad.uuid.clone(),
+                    layers: pad.layers.clone(),
                 })
                 .collect(),
         })
@@ -1987,17 +2664,18 @@ fn build_manifest(
         coordinate_unit: "um".to_string(),
         resolution: DSN_RESOLUTION as u32,
         supported_profile: SupportedProfile {
-            copper_layers: 2,
-            component_side: "front".to_string(),
+            copper_layers: u32::try_from(copper_layers.len())
+                .context("copper layer count does not fit the manifest")?,
+            component_side: component_side(footprints).to_string(),
             pad_shapes: ["circle", "rect", "roundrect", "oval"]
                 .map(String::from)
                 .to_vec(),
             existing_routing: !locked_routing.tracks.is_empty() || !locked_routing.vias.is_empty(),
             locked_track_count: locked_routing.tracks.len(),
             locked_via_count: locked_routing.vias.len(),
-            copper_zones: false,
+            copper_zones: !zones.is_empty(),
             custom_rules: false,
-            outline: "one closed loop of straight Edge.Cuts lines".to_string(),
+            outline: "one closed loop of Edge.Cuts lines and circular arcs, with arcs flattened within board max_error".to_string(),
         },
         layers: copper_layers
             .iter()
@@ -2011,6 +2689,7 @@ fn build_manifest(
         components,
         nets,
         padstacks,
+        zones: zone_inventory(zones),
     })
     .context("serialize routing manifest")
 }
@@ -2063,10 +2742,19 @@ fn refuse_per_layer_padstack(item: &SexpNode, label: &str) -> Result<()> {
 
 fn point_um(node: &SexpNode, tag: &str) -> Result<(i64, i64)> {
     let point = node.find(tag).with_context(|| format!("missing '{tag}'"))?;
-    Ok((
-        finite_um(point.get_f64(1), tag)?,
-        -finite_um(point.get_f64(2), tag)?,
-    ))
+    let y = finite_um(point.get_f64(2), tag)?
+        .checked_neg()
+        .with_context(|| format!("{tag} is outside the supported coordinate range"))?;
+    Ok((finite_um(point.get_f64(1), tag)?, y))
+}
+
+fn point_um_f64(node: &SexpNode, tag: &str) -> Result<(f64, f64)> {
+    let point = node.find(tag).with_context(|| format!("missing '{tag}'"))?;
+    let y = -finite_um_f64(point.get_f64(2), tag)?;
+    if y >= I64_UPPER_EXCLUSIVE {
+        bail!("{tag} is outside the supported coordinate range");
+    }
+    Ok((finite_um_f64(point.get_f64(1), tag)?, y))
 }
 
 fn finite_number(value: Option<f64>, label: &str) -> Result<f64> {
@@ -2079,10 +2767,18 @@ fn finite_number(value: Option<f64>, label: &str) -> Result<f64> {
 
 fn finite_um(value: Option<f64>, label: &str) -> Result<i64> {
     let value = finite_number(value, label)? * UM_PER_MM;
-    if value < i64::MIN as f64 || value > i64::MAX as f64 {
+    if value < i64::MIN as f64 || value >= I64_UPPER_EXCLUSIVE {
         bail!("{label} is outside the supported coordinate range");
     }
     Ok(value.round() as i64)
+}
+
+fn finite_um_f64(value: Option<f64>, label: &str) -> Result<f64> {
+    let value_um = finite_number(value, label)? * UM_PER_MM;
+    if !value_um.is_finite() || value_um < i64::MIN as f64 || value_um >= I64_UPPER_EXCLUSIVE {
+        bail!("{label} is outside the supported coordinate range");
+    }
+    Ok(value_um)
 }
 
 fn positive_um(value: Option<f64>, label: &str) -> Result<i64> {
@@ -2516,7 +3212,7 @@ pub(crate) mod tests {
             bundle.dsn
         );
         let manifest: serde_json::Value = serde_json::from_str(&bundle.manifest).unwrap();
-        assert_eq!(manifest["schema_version"], 2);
+        assert_eq!(manifest["schema_version"], 4);
         assert_eq!(
             j1_pins(&bundle),
             [
@@ -3158,6 +3854,237 @@ pub(crate) mod tests {
         assert!(error.contains("degree"), "{error}");
     }
 
+    const ROUNDED_OUTLINE: &str =
+        include_str!("../tests/fixtures/specctra_rounded_outline.kicad_pcb");
+
+    fn point_segment_distance(point: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
+        let delta = (b.0 - a.0, b.1 - a.1);
+        let t = (((point.0 - a.0) * delta.0 + (point.1 - a.1) * delta.1)
+            / (delta.0 * delta.0 + delta.1 * delta.1))
+            .clamp(0.0, 1.0);
+        (point.0 - a.0 - t * delta.0).hypot(point.1 - a.1 - t * delta.1)
+    }
+
+    fn boundary_points(dsn: &str) -> Vec<(f64, f64)> {
+        let tree = parse_dsn_sexp(dsn).unwrap();
+        let path = tree
+            .find("structure")
+            .unwrap()
+            .find("boundary")
+            .unwrap()
+            .find("path")
+            .unwrap();
+        path.children().unwrap()[3..]
+            .chunks_exact(2)
+            .map(|pair| {
+                (
+                    pair[0].as_str().unwrap().parse().unwrap(),
+                    pair[1].as_str().unwrap().parse().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rounded_outline_arc_is_flattened_and_closed() {
+        let tree = parse_sexp(ROUNDED_OUTLINE).unwrap();
+        let outline = simple_closed_outline(&tree, 5.0).unwrap();
+        assert_eq!(outline.first(), outline.last());
+        // Three convex corners (12 chords each), one concave notch (19), four lines.
+        assert_eq!(outline.len(), 12 * 3 + 19 + 4 + 1);
+    }
+
+    #[test]
+    fn exporter_accepts_rounded_outline_arcs_and_reports_tolerance() {
+        let temp = tempfile::tempdir().unwrap();
+        let board_path = temp.path().join("rounded.kicad_pcb");
+        std::fs::write(
+            board_path.with_extension("kicad_pro"),
+            include_str!("../tests/fixtures/specctra_rounded_outline.kicad_pro"),
+        )
+        .unwrap();
+        let export = export_dsn(&board_path, ROUNDED_OUTLINE, &rules()).unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(&export.manifest).unwrap();
+        assert_eq!(
+            manifest["supported_profile"]["outline"],
+            "one closed loop of Edge.Cuts lines and circular arcs, with arcs flattened within board max_error"
+        );
+        let native = include_str!("../tests/fixtures/specctra_rounded_outline.native-kicad-10.dsn");
+        // Independent circles and counts from KiCad's native export, not the flattener.
+        for points in [boundary_points(&export.dsn), boundary_points(native)] {
+            assert_eq!(points.first(), points.last());
+            for (center, radius, expected_segments) in [
+                ((128_000.0, -32_000.0), 2_000.0, 12),
+                ((130_000.0, -70_000.0), 5_000.0, 19),
+                ((82_000.0, -68_000.0), 2_000.0, 12),
+                ((82_000.0, -32_000.0), 2_000.0, 12),
+            ] {
+                let radial_error =
+                    |p: (f64, f64)| ((p.0 - center.0).hypot(p.1 - center.1) - radius).abs();
+                let arc_edges = points
+                    .windows(2)
+                    .filter(|edge| radial_error(edge[0]) < 5.0 && radial_error(edge[1]) < 5.0)
+                    .collect::<Vec<_>>();
+                assert_eq!(arc_edges.len(), expected_segments, "circle {center:?}");
+                for edge in arc_edges {
+                    assert!(radial_error(edge[0]) <= 5.0);
+                    assert!(radial_error(edge[1]) <= 5.0);
+                    let midpoint = ((edge[0].0 + edge[1].0) / 2.0, (edge[0].1 + edge[1].1) / 2.0);
+                    assert!(radial_error(midpoint) <= 5.0, "chord {edge:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn outline_arc_flattening_respects_tolerance_in_both_directions() {
+        let tree = parse_sexp(ROUNDED_OUTLINE).unwrap();
+        for arc in tree.find_all("gr_arc") {
+            let start = point_um_f64(arc, "start").unwrap();
+            let mid = point_um_f64(arc, "mid").unwrap();
+            let end = point_um_f64(arc, "end").unwrap();
+            for (start, end) in [(start, end), (end, start)] {
+                let points = outline_arc_points(start, mid, end, 5.0).unwrap();
+                assert_eq!(
+                    points.first(),
+                    Some(&(start.0.round() as i64, start.1.round() as i64))
+                );
+                assert_eq!(
+                    points.last(),
+                    Some(&(end.0.round() as i64, end.1.round() as i64))
+                );
+                let distance = points
+                    .windows(2)
+                    .map(|edge| {
+                        point_segment_distance(
+                            mid,
+                            (edge[0].0 as f64, edge[0].1 as f64),
+                            (edge[1].0 as f64, edge[1].1 as f64),
+                        )
+                    })
+                    .fold(f64::INFINITY, f64::min);
+                assert!(distance <= 5.0, "arc misses its midpoint by {distance} um");
+            }
+        }
+    }
+
+    const D_OUTLINE: &str = include_str!("../tests/fixtures/specctra_d_outline.kicad_pcb");
+    const D_OUTLINE_ARC: &str = "(gr_arc\n\t\t(start 90 25)\n\t\t(mid 115 50)\n\t\t(end 90 75)";
+
+    #[test]
+    fn exporter_accepts_a_two_edge_d_shaped_outline() {
+        let export = export_dsn(Path::new("board.kicad_pcb"), D_OUTLINE, &rules()).unwrap();
+        let native = include_str!("../tests/fixtures/specctra_d_outline.native-kicad-10.dsn");
+        // KiCad's native export splits the 25 mm half circle into 80 chords.
+        // The Rust flattener keeps each chord within max_error minus the DSN
+        // grid allowance, which needs 85 at this radius (the small corners of
+        // the rounded fixture happen to give equal counts).
+        let (center, radius) = ((90_000.0, -50_000.0), 25_000.0);
+        let radial_error = |p: (f64, f64)| ((p.0 - center.0).hypot(p.1 - center.1) - radius).abs();
+        for (points, expected_chords) in [
+            (boundary_points(&export.dsn), 85),
+            (boundary_points(native), 80),
+        ] {
+            assert_eq!(points.first(), points.last());
+            let (arc_edges, straight_edges): (Vec<_>, Vec<_>) =
+                points.windows(2).partition(|edge| {
+                    let midpoint = ((edge[0].0 + edge[1].0) / 2.0, (edge[0].1 + edge[1].1) / 2.0);
+                    radial_error(midpoint) <= 5.0
+                });
+            assert_eq!(arc_edges.len(), expected_chords);
+            for edge in arc_edges {
+                assert!(radial_error(edge[0]) <= 5.0, "chord {edge:?}");
+                assert!(radial_error(edge[1]) <= 5.0, "chord {edge:?}");
+                // The half circle bulges through (115, 50), not to x < 90 mm.
+                assert!(edge.iter().all(|p| p.0 >= 89_999.5), "chord {edge:?}");
+            }
+            // The straight edge is the line x = 90 mm from y = 25 mm to 75 mm.
+            assert_eq!(straight_edges.len(), 1);
+            let line = straight_edges[0];
+            assert!(line.iter().all(|p| (p.0 - 90_000.0).abs() < 0.5));
+            assert!(((line[0].1 - line[1].1).abs() - 50_000.0).abs() < 0.5);
+        }
+    }
+
+    #[test]
+    fn two_edge_outlines_without_area_are_refused() {
+        let two_lines = D_OUTLINE.replace(
+            D_OUTLINE_ARC,
+            "(gr_line\n\t\t(start 90 75)\n\t\t(end 90 25)",
+        );
+        let same_arc_twice = D_OUTLINE.replace(
+            "(gr_line\n\t\t(start 90 25)\n\t\t(end 90 75)",
+            D_OUTLINE_ARC,
+        );
+        for source in [two_lines, same_arc_twice] {
+            assert_ne!(source, D_OUTLINE);
+            let error = export_dsn(Path::new("board.kicad_pcb"), &source, &rules())
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("enclose no area"), "{error}");
+        }
+    }
+
+    #[test]
+    fn board_without_edge_cuts_is_refused() {
+        let source = D_OUTLINE.replace("(layer \"Edge.Cuts\")", "(layer \"F.SilkS\")");
+        assert_ne!(source, D_OUTLINE);
+        let error = export_dsn(Path::new("board.kicad_pcb"), &source, &rules())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no Edge.Cuts lines or arcs"), "{error}");
+    }
+
+    #[test]
+    fn multiple_outline_loops_are_refused() {
+        let source = include_str!("../tests/fixtures/specctra_multiple_outline_loops.kicad_pcb");
+        let error = export_dsn(Path::new("board.kicad_pcb"), source, &rules())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("more than one loop"), "{error}");
+    }
+
+    #[test]
+    fn outline_arc_error_uses_project_max_error_when_available() {
+        let temp = tempfile::tempdir().unwrap();
+        let board_path = temp.path().join("board.kicad_pcb");
+        let tree = parse_sexp(ROUNDED_OUTLINE).unwrap();
+        let mut project: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/specctra_rounded_outline.kicad_pro"
+        ))
+        .unwrap();
+        project["board"]["design_settings"]["rules"]["max_error"] = serde_json::json!(0.01);
+        std::fs::write(
+            board_path.with_extension("kicad_pro"),
+            serde_json::to_vec(&project).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(outline_arc_error_um(&board_path, &tree).unwrap(), 10.0);
+        let outline =
+            simple_closed_outline(&tree, outline_arc_error_um(&board_path, &tree).unwrap())
+                .unwrap();
+        assert_eq!(outline.len(), 9 * 3 + 13 + 4 + 1);
+    }
+
+    #[test]
+    fn malformed_outline_project_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let board_path = temp.path().join("board.kicad_pcb");
+        for (project, expected) in [
+            ("{", "parse project"),
+            (
+                r#"{"board":{"design_settings":{"rules":{"max_error":"bad"}}}}"#,
+                "max_error is not a number",
+            ),
+        ] {
+            std::fs::write(board_path.with_extension("kicad_pro"), project).unwrap();
+            let error = export_dsn(&board_path, ROUNDED_OUTLINE, &rules())
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
     #[test]
     fn nonzero_pad_shape_offset_is_refused() {
         let source = include_str!("../tests/fixtures/specctra_two_resistors.kicad_pcb").replacen(
@@ -3327,6 +4254,1145 @@ pub(crate) mod tests {
             .to_string();
         assert!(
             error.contains("locked via at (105, 50) mm has a 'front_inner_back' padstack"),
+            "{error}"
+        );
+    }
+
+    /// KiCad 10's four-layer copy of the locked two-resistor board, with a
+    /// stock through-hole header and a locked track on `In1.Cu`. See its README.
+    const FOUR_LAYERS: &str = include_str!("../tests/fixtures/specctra_four_layers.kicad_pcb");
+    const FOUR_LAYERS_NATIVE_FILE: &str =
+        include_str!("../tests/fixtures/specctra_four_layers.native-kicad-10.dsn");
+
+    /// The native DSN without the header's courtyard polygon, which the DSN
+    /// parser does not read yet, as the odd oval-pad test does too.
+    fn four_layers_native() -> String {
+        FOUR_LAYERS_NATIVE_FILE
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("(outline (polygon "))
+            .map(|line| format!("{line}\n"))
+            .collect()
+    }
+
+    fn copper_of(table: &str) -> Result<Vec<String>> {
+        copper_layers(&parse_sexp(&format!("(kicad_pcb (layers {table}))")).unwrap())
+    }
+
+    #[test]
+    fn copper_layers_run_top_to_bottom_whatever_the_file_order() {
+        assert_eq!(
+            copper_of(r#"(0 "F.Cu" signal) (2 "B.Cu" signal) (9 "F.Adhes" user)"#).unwrap(),
+            ["F.Cu", "B.Cu"]
+        );
+        // KiCad 10 writes the table top to bottom, as in the four-layer fixture.
+        assert_eq!(
+            copper_of(
+                r#"(0 "F.Cu" signal) (4 "In1.Cu" power) (6 "In2.Cu" mixed) (2 "B.Cu" signal)"#
+            )
+            .unwrap(),
+            ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"]
+        );
+        // An order KiCad does not write in the table gives the same stack.
+        assert_eq!(
+            copper_of(
+                r#"(0 "F.Cu" signal) (2 "B.Cu" signal) (4 "In1.Cu" power) (6 "In2.Cu" mixed)"#
+            )
+            .unwrap(),
+            ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"]
+        );
+        for table in [
+            r#"(0 "F.Cu" signal) (6 "In2.Cu" signal) (2 "B.Cu" signal)"#,
+            r#"(0 "F.Cu" signal) (4 "In1.Cu" signal) (2 "B.Cu" signal)"#,
+            r#"(0 "F.Cu" signal) (4 "In1.Cu" signal) (6 "In2.Cu" signal)"#,
+            r#"(0 "F.Cu" signal) (0 "F.Cu" signal) (2 "B.Cu" signal)"#,
+            r#"(0 "F.Cu" signal)"#,
+            r#"(9 "F.Adhes" user)"#,
+        ] {
+            let error = copper_of(table).unwrap_err().to_string();
+            assert!(
+                error.contains("copper layers must be F.Cu, In1.Cu..In<N-2>.Cu and B.Cu"),
+                "{table}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn four_layer_board_exports_every_copper_layer() {
+        let export = export_dsn(
+            Path::new("board.kicad_pcb"),
+            FOUR_LAYERS,
+            &native_fixture_rules(),
+        )
+        .unwrap();
+        assert_eq!(export.copper_layer_count, 4);
+        let tree = parse_dsn_sexp(&export.dsn).unwrap();
+        let identity = dsn_identity(&tree).unwrap();
+        assert_eq!(
+            identity.layers.values().collect::<Vec<_>>(),
+            ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"]
+        );
+        // The header's through-hole pads and the via cover all four layers.
+        for name in ["In1.Cu", "In2.Cu"] {
+            assert!(
+                export
+                    .dsn
+                    .contains(&format!("(rect {name} -850 -850 850 850)")),
+                "{}",
+                export.dsn
+            );
+            assert!(
+                export.dsn.contains(&format!("(circle {name} 600)")),
+                "{}",
+                export.dsn
+            );
+        }
+        assert!(
+            export
+                .dsn
+                .contains("(path In1.Cu 250 105000 -50000 105000 -55000)"),
+            "{}",
+            export.dsn
+        );
+        let manifest: serde_json::Value = serde_json::from_str(&export.manifest).unwrap();
+        assert_eq!(manifest["supported_profile"]["copper_layers"], 4);
+        assert_eq!(manifest["supported_profile"]["locked_track_count"], 2);
+        assert_eq!(manifest["supported_profile"]["locked_via_count"], 1);
+        assert_eq!(
+            manifest["layers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|layer| (
+                    layer["index"].as_u64().unwrap(),
+                    layer["kicad_name"].as_str().unwrap()
+                ))
+                .collect::<Vec<_>>(),
+            [(0, "F.Cu"), (1, "In1.Cu"), (2, "In2.Cu"), (3, "B.Cu")]
+        );
+        let via = manifest["padstacks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|padstack| padstack["purpose"] == "via")
+            .unwrap();
+        assert_eq!(
+            via["layers"],
+            serde_json::json!(["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"])
+        );
+    }
+
+    /// KiCad's own export of the same board passes the semantic comparison
+    /// layer by layer, pad by pad: both paths describe one routing job.
+    #[test]
+    fn four_layer_native_dsn_matches_the_rust_export() {
+        let baseline = native_baseline(FOUR_LAYERS);
+        let adopted = adopt_native_dsn(baseline, four_layers_native()).unwrap();
+        assert_eq!(adopted.dsn, four_layers_native());
+        assert_ne!(adopted.dsn, FOUR_LAYERS_NATIVE_FILE);
+        let manifest: serde_json::Value = serde_json::from_str(&adopted.manifest).unwrap();
+        assert!(manifest["padstacks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|padstack| padstack["name"] == "Via[0-3]_600:300_um"));
+    }
+
+    #[test]
+    fn four_layer_through_hole_pad_must_cover_every_copper_layer() {
+        let two_layer_pad = FOUR_LAYERS.replacen(
+            r#"(layers "*.Cu" "*.Mask")"#,
+            r#"(layers "F.Cu" "B.Cu" "*.Mask")"#,
+            1,
+        );
+        assert_ne!(two_layer_pad, FOUR_LAYERS);
+        let error = export_dsn(
+            Path::new("board.kicad_pcb"),
+            &two_layer_pad,
+            &native_fixture_rules(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("unsupported through-hole pad J1-1: copper layers are [F.Cu, B.Cu]"),
+            "{error}"
+        );
+        // KiCad saves a pad on every copper layer as `*.Cu`; a list in full
+        // is accepted in the ordinal order of pad lists or top to bottom.
+        for list in [
+            r#""F.Cu" "B.Cu" "In1.Cu" "In2.Cu""#,
+            r#""F.Cu" "In1.Cu" "In2.Cu" "B.Cu""#,
+        ] {
+            let listed = FOUR_LAYERS.replacen(
+                r#"(layers "*.Cu" "*.Mask")"#,
+                &format!(r#"(layers {list} "*.Mask")"#),
+                1,
+            );
+            assert_ne!(listed, FOUR_LAYERS);
+            export_dsn(
+                Path::new("board.kicad_pcb"),
+                &listed,
+                &native_fixture_rules(),
+            )
+            .unwrap_or_else(|error| panic!("{list}: {error}"));
+        }
+        // Every layer named, but one of them twice, or one missing.
+        for list in [
+            r#""F.Cu" "B.Cu" "In1.Cu" "In2.Cu" "In2.Cu""#,
+            r#""F.Cu" "B.Cu" "In1.Cu" "In1.Cu""#,
+        ] {
+            let repeated = FOUR_LAYERS.replacen(
+                r#"(layers "*.Cu" "*.Mask")"#,
+                &format!(r#"(layers {list} "*.Mask")"#),
+                1,
+            );
+            let error = export_dsn(
+                Path::new("board.kicad_pcb"),
+                &repeated,
+                &native_fixture_rules(),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains("unsupported through-hole pad J1-1: copper layers are"),
+                "{list}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn four_layer_locked_via_must_be_a_through_via() {
+        let blind_span = FOUR_LAYERS.replacen(
+            "(drill 0.3)\n\t\t(layers \"F.Cu\" \"B.Cu\")",
+            "(drill 0.3)\n\t\t(layers \"F.Cu\" \"In1.Cu\")",
+            1,
+        );
+        assert_ne!(blind_span, FOUR_LAYERS);
+        let error = export_dsn(
+            Path::new("board.kicad_pcb"),
+            &blind_span,
+            &native_fixture_rules(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains(
+                "unsupported locked via layer span [F.Cu, In1.Cu]; expected [F.Cu, B.Cu]"
+            ),
+            "{error}"
+        );
+    }
+
+    /// Freerouting 2.3.0 routed KiCad's native four-layer export on F.Cu,
+    /// In1.Cu and In2.Cu with two vias; the strict planner accepts the session, inner
+    /// layers included.
+    #[test]
+    fn freerouting_routes_four_layers_and_the_planner_accepts_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let board = temp.path().join("specctra_four_layers.kicad_pcb");
+        std::fs::write(&board, FOUR_LAYERS).unwrap();
+        let baseline = export_dsn(&board, FOUR_LAYERS, &native_fixture_rules()).unwrap();
+        let adopted = adopt_native_dsn(baseline, four_layers_native()).unwrap();
+        let ses = include_str!(
+            "../tests/fixtures/specctra_four_layers.native-kicad-10.freerouting-2.3.0.ses"
+        );
+        let plan =
+            crate::specctra_ses::parse_import_plan(&board, FOUR_LAYERS, &adopted.manifest, ses)
+                .unwrap();
+        let layers = plan
+            .tracks
+            .iter()
+            .map(|track| track.layer.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(layers, BTreeSet::from(["F.Cu", "In1.Cu", "In2.Cu"]));
+        assert_eq!(plan.vias.len(), 2);
+
+        // A session that names a layer the manifest does not map is refused.
+        let stray = ses.replacen("(path In2.Cu", "(path In3.Cu", 1);
+        assert_ne!(stray, ses);
+        let error =
+            crate::specctra_ses::parse_import_plan(&board, FOUR_LAYERS, &adopted.manifest, &stray)
+                .unwrap_err()
+                .to_string();
+        assert!(
+            error.contains("SES path uses unknown layer 'In3.Cu'"),
+            "{error}"
+        );
+    }
+
+    /// The manifest's layer mappings are the count it declares, top to bottom.
+    #[test]
+    fn manifest_layer_mappings_must_match_its_copper_layer_count() {
+        let temp = tempfile::tempdir().unwrap();
+        let board = temp.path().join("specctra_four_layers.kicad_pcb");
+        std::fs::write(&board, FOUR_LAYERS).unwrap();
+        let export = export_dsn(&board, FOUR_LAYERS, &native_fixture_rules()).unwrap();
+        let ses = include_str!(
+            "../tests/fixtures/specctra_four_layers.native-kicad-10.freerouting-2.3.0.ses"
+        );
+        let adopted = adopt_native_dsn(export, four_layers_native()).unwrap();
+        let mut manifest: serde_json::Value = serde_json::from_str(&adopted.manifest).unwrap();
+        let mapping = "manifest layer mappings do not match its";
+        let profile = "manifest does not describe the supported first routing profile";
+        type ManifestEdit = fn(&mut serde_json::Value);
+        let cases: [(&str, &str, ManifestEdit); 4] = [
+            ("count", mapping, |m| {
+                m["supported_profile"]["copper_layers"] = 2.into()
+            }),
+            // Three layers mapped as F.Cu, In1.Cu, B.Cu: only the count is wrong.
+            ("odd", profile, |m| {
+                m["supported_profile"]["copper_layers"] = 3.into();
+                m["layers"].as_array_mut().unwrap().remove(2);
+                m["layers"][2]["index"] = 2.into();
+            }),
+            // B.Cu unmapped: the session never routes on it.
+            ("dropped", mapping, |m| {
+                m["layers"].as_array_mut().unwrap().remove(3);
+            }),
+            ("swapped", mapping, |m| {
+                m["layers"][1]["kicad_name"] = "In2.Cu".into();
+                m["layers"][2]["kicad_name"] = "In1.Cu".into();
+            }),
+        ];
+        for (name, expected, edit) in cases {
+            let mut edited = manifest.clone();
+            edit(&mut edited);
+            let error = crate::specctra_ses::parse_import_plan(
+                &board,
+                FOUR_LAYERS,
+                &edited.to_string(),
+                ses,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(expected), "{name}: {error}");
+        }
+        manifest["schema_version"] = 2.into();
+        crate::specctra_ses::parse_import_plan(&board, FOUR_LAYERS, &manifest.to_string(), ses)
+            .unwrap();
+    }
+
+    /// Two stock pin headers whose pads share 1.7 mm copper but not a drill
+    /// (1.0 and 0.8 mm). See its README.
+    const PADSTACK_DRILLS: &str =
+        include_str!("../tests/fixtures/specctra_padstack_drills.kicad_pcb");
+    const PADSTACK_DRILLS_NATIVE_FILE: &str =
+        include_str!("../tests/fixtures/specctra_padstack_drills.native-kicad-10.dsn");
+
+    /// The native DSN without the header's courtyard polygon, which the DSN
+    /// parser does not read yet.
+    fn padstack_drills_native() -> String {
+        PADSTACK_DRILLS_NATIVE_FILE
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("(outline (polygon "))
+            .map(|line| format!("{line}\n"))
+            .collect()
+    }
+
+    /// KiCad names both headers' pads after their copper alone: J1's 1.0 mm
+    /// and J2's 0.8 mm holes share one native padstack per shape. Adoption
+    /// refuses before routing and names the pads, instead of a manifest that
+    /// the importer refuses once the board is routed.
+    #[test]
+    fn native_padstacks_merged_across_drills_are_refused_before_routing() {
+        let error = adopt_native_dsn(native_baseline(PADSTACK_DRILLS), padstack_drills_native())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("KiCad native DSN gives one padstack 'Rect[A]Pad_1700.000000x1700.000000_um' to pads that the Rust export keeps apart"),
+            "{error}"
+        );
+        assert!(
+            error.contains("J2-1 (drill 800 um)") && error.contains("J1-1 (drill 1000 um)"),
+            "{error}"
+        );
+    }
+
+    /// The same pads in the Rust export: one padstack per shape and drill,
+    /// and Freerouting 2.3.0's session for that DSN (0 unrouted) imports.
+    #[test]
+    fn rust_export_keeps_drills_apart_and_its_session_imports() {
+        let temp = tempfile::tempdir().unwrap();
+        let board = temp.path().join("specctra_padstack_drills.kicad_pcb");
+        std::fs::write(&board, PADSTACK_DRILLS).unwrap();
+        let export = export_dsn(&board, PADSTACK_DRILLS, &native_fixture_rules()).unwrap();
+        let manifest: Manifest = serde_json::from_str(&export.manifest).unwrap();
+        let through = manifest
+            .padstacks
+            .iter()
+            .filter(|padstack| padstack.purpose == "pad")
+            .filter_map(|padstack| {
+                padstack
+                    .drill_um
+                    .map(|drill| (padstack.shape, padstack.size_x_um, drill))
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            through,
+            BTreeSet::from([
+                (PadShape::Circle, 1700, 800),
+                (PadShape::Circle, 1700, 1000),
+                (PadShape::Rect, 1700, 800),
+                (PadShape::Rect, 1700, 1000),
+            ])
+        );
+        let names = manifest
+            .padstacks
+            .iter()
+            .map(|padstack| padstack.name.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(names.len(), manifest.padstacks.len());
+        let ses = include_str!("../tests/fixtures/specctra_padstack_drills.freerouting-2.3.0.ses");
+        let plan =
+            crate::specctra_ses::parse_import_plan(&board, PADSTACK_DRILLS, &export.manifest, ses)
+                .unwrap();
+        assert!(!plan.tracks.is_empty());
+    }
+
+    /// The four-layer board with a GND plane on In1.Cu, a VCC plane on In2.Cu
+    /// and a GND pour on F.Cu and B.Cu, filled by KiCad. See its README.
+    const ZONES: &str = include_str!("../tests/fixtures/specctra_zones.kicad_pcb");
+    const ZONES_NATIVE_FILE: &str =
+        include_str!("../tests/fixtures/specctra_zones.native-kicad-10.dsn");
+    const ZONES_SES: &str =
+        include_str!("../tests/fixtures/specctra_zones.native-kicad-10.freerouting-2.3.0.ses");
+
+    /// Without the header's courtyard polygon, as for the four-layer board.
+    fn zones_native() -> String {
+        ZONES_NATIVE_FILE
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("(outline (polygon "))
+            .map(|line| format!("{line}\n"))
+            .collect()
+    }
+
+    fn zone_counts(manifest: &serde_json::Value) -> Vec<(String, String, u64)> {
+        manifest["zones"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|zone| {
+                (
+                    zone["layer"].as_str().unwrap().to_string(),
+                    zone["net"].as_str().unwrap().to_string(),
+                    zone["count"].as_u64().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn copper_zones_export_as_planes_on_each_layer_they_cover() {
+        let export = native_baseline(ZONES);
+        assert_eq!(export.copper_zone_count, 3);
+        let identity = dsn_identity(&parse_dsn_sexp(&export.dsn).unwrap()).unwrap();
+        let square = vec![
+            (81000, -31000),
+            (129000, -31000),
+            (129000, -69000),
+            (81000, -69000),
+            (81000, -31000),
+        ];
+        let pour = vec![
+            (82000, -60000),
+            (95000, -60000),
+            (95000, -68000),
+            (82000, -68000),
+            (82000, -60000),
+        ];
+        assert_eq!(
+            identity.planes,
+            [
+                ("GND".to_string(), "B.Cu".to_string(), pour.clone()),
+                ("GND".to_string(), "F.Cu".to_string(), pour),
+                ("GND".to_string(), "In1.Cu".to_string(), square.clone()),
+                ("VCC".to_string(), "In2.Cu".to_string(), square),
+            ]
+        );
+        let manifest: serde_json::Value = serde_json::from_str(&export.manifest).unwrap();
+        assert_eq!(manifest["schema_version"], 4);
+        assert_eq!(manifest["supported_profile"]["copper_zones"], true);
+        let count = |layer: &str, net: &str| (layer.to_string(), net.to_string(), 1);
+        assert_eq!(
+            zone_counts(&manifest),
+            [
+                count("B.Cu", "GND"),
+                count("F.Cu", "GND"),
+                count("In1.Cu", "GND"),
+                count("In2.Cu", "VCC"),
+            ]
+        );
+        // A board without zones writes neither planes nor an inventory.
+        let plain = native_baseline(FOUR_LAYERS);
+        assert_eq!(plain.copper_zone_count, 0);
+        assert!(!plain.dsn.contains("(plane "), "{}", plain.dsn);
+        let manifest: serde_json::Value = serde_json::from_str(&plain.manifest).unwrap();
+        assert_eq!(manifest["supported_profile"]["copper_zones"], false);
+        assert!(manifest.get("zones").is_none(), "{manifest}");
+    }
+
+    /// KiCad's own export writes the same planes, in another order.
+    #[test]
+    fn zone_native_dsn_matches_the_rust_export() {
+        let adopted = adopt_native_dsn(native_baseline(ZONES), zones_native()).unwrap();
+        assert_eq!(adopted.dsn, zones_native());
+        let manifest: serde_json::Value = serde_json::from_str(&adopted.manifest).unwrap();
+        assert_eq!(zone_counts(&manifest).len(), 4);
+
+        let moved = zones_native().replacen("95000 -60000", "95000 -61000", 1);
+        assert_ne!(moved, zones_native());
+        let renetted = zones_native().replacen("(plane VCC", "(plane GND", 1);
+        let mut dropped = zones_native();
+        let start = dropped.find("    (plane VCC").unwrap();
+        let end = start + dropped[start..].find("))\n").unwrap() + 3;
+        dropped.replace_range(start..end, "");
+        for (name, native) in [
+            ("moved", moved),
+            ("renetted", renetted),
+            ("dropped", dropped),
+        ] {
+            let error = adopt_native_dsn(native_baseline(ZONES), native)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("native DSN changed the copper-zone planes"),
+                "{name}: {error}"
+            );
+        }
+    }
+
+    /// Freerouting 2.3.0 reaches the planes through vias; the planner takes
+    /// the session and carries the zone inventory to the import's response.
+    #[test]
+    fn freerouting_routes_to_the_planes_and_the_planner_keeps_the_zones() {
+        let temp = tempfile::tempdir().unwrap();
+        let board = temp.path().join("specctra_zones.kicad_pcb");
+        std::fs::write(&board, ZONES).unwrap();
+        let baseline = export_dsn(&board, ZONES, &native_fixture_rules()).unwrap();
+        let adopted = adopt_native_dsn(baseline, zones_native()).unwrap();
+        let plan =
+            crate::specctra_ses::parse_import_plan(&board, ZONES, &adopted.manifest, ZONES_SES)
+                .unwrap();
+        assert!(!plan.vias.is_empty());
+        assert_eq!(
+            plan.zones
+                .iter()
+                .map(|zone| (zone.layer.as_str(), zone.net.as_str(), zone.count))
+                .collect::<Vec<_>>(),
+            [
+                ("B.Cu", "GND", 1),
+                ("F.Cu", "GND", 1),
+                ("In1.Cu", "GND", 1),
+                ("In2.Cu", "VCC", 1)
+            ]
+        );
+    }
+
+    /// The manifest's zone inventory is the live board's, from schema 3.
+    #[test]
+    fn manifest_zone_inventory_must_match_the_live_board() {
+        let temp = tempfile::tempdir().unwrap();
+        let board = temp.path().join("specctra_zones.kicad_pcb");
+        std::fs::write(&board, ZONES).unwrap();
+        let adopted = adopt_native_dsn(
+            export_dsn(&board, ZONES, &native_fixture_rules()).unwrap(),
+            zones_native(),
+        )
+        .unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(&adopted.manifest).unwrap();
+        let inventory = "manifest copper-zone inventory does not match the live board snapshot";
+        let flag = "manifest copper-zone flag does not match its zone inventory";
+        type ManifestEdit = fn(&mut serde_json::Value);
+        let cases: [(&str, &str, ManifestEdit); 6] = [
+            ("count", inventory, |m| m["zones"][0]["count"] = 2.into()),
+            ("net", inventory, |m| m["zones"][3]["net"] = "GND".into()),
+            ("layer", inventory, |m| {
+                m["zones"][2]["layer"] = "In2.Cu".into()
+            }),
+            ("dropped", inventory, |m| {
+                m["zones"].as_array_mut().unwrap().remove(1);
+            }),
+            ("unflagged", flag, |m| {
+                m["supported_profile"]["copper_zones"] = false.into()
+            }),
+            ("schema 2", flag, |m| m["schema_version"] = 2.into()),
+        ];
+        for (name, expected, edit) in cases {
+            let mut edited = manifest.clone();
+            edit(&mut edited);
+            let error = crate::specctra_ses::parse_import_plan(
+                &board,
+                ZONES,
+                &edited.to_string(),
+                ZONES_SES,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(expected), "{name}: {error}");
+        }
+        // A zone-free manifest against a board with zones.
+        let mut emptied = manifest.clone();
+        emptied.as_object_mut().unwrap().remove("zones");
+        emptied["supported_profile"]["copper_zones"] = false.into();
+        let error =
+            crate::specctra_ses::parse_import_plan(&board, ZONES, &emptied.to_string(), ZONES_SES)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains(inventory), "{error}");
+    }
+
+    /// What the planes cannot say exactly is refused, not approximated.
+    #[test]
+    fn zones_the_planes_cannot_describe_are_refused() {
+        let plane = "(layer \"In1.Cu\")\n\t\t(uuid";
+        let outline = "(polygon\n\t\t\t(pts\n\t\t\t\t(xy 81 31)";
+        let cases = [
+            (
+                "rule area",
+                ZONES.replacen("(name \"gnd_plane\")", "(name \"gnd_plane\") (keepout (tracks not_allowed))", 1),
+                "board contains a rule area",
+            ),
+            (
+                "no net",
+                ZONES.replacen("(net \"VCC\")\n\t\t(layer \"In2.Cu\")", "(net \"\")\n\t\t(layer \"In2.Cu\")", 1),
+                "copper zone 'vcc_plane' has no net",
+            ),
+            (
+                "cutout",
+                ZONES.replacen(
+                    outline,
+                    "(polygon (pts (xy 100 40) (xy 110 40) (xy 110 45)))\n\t\t(polygon\n\t\t\t(pts\n\t\t\t\t(xy 81 31)",
+                    1,
+                ),
+                "copper zone 'gnd_plane' on net 'GND' has 2 outlines",
+            ),
+            (
+                "arc",
+                ZONES.replacen(
+                    "(xy 81 31) (xy 129 31)",
+                    "(xy 81 31) (arc (start 100 31) (mid 105 30) (end 110 31)) (xy 129 31)",
+                    1,
+                ),
+                "outline has a 'arc' point",
+            ),
+            (
+                "not copper",
+                ZONES.replacen(plane, "(layer \"F.SilkS\")\n\t\t(uuid", 1),
+                "copper zone 'gnd_plane' is on 'F.SilkS', which is not a copper layer of the board",
+            ),
+            (
+                "padless net",
+                ZONES.replacen("(net \"VCC\")\n\t\t(layer \"In2.Cu\")", "(net \"SPARE\")\n\t\t(layer \"In2.Cu\")", 1),
+                "copper zone on net 'SPARE', which has no pad",
+            ),
+            (
+                "footprint zone",
+                ZONES.replacen(
+                    "(property \"Reference\" \"J1\"",
+                    "(zone (net \"GND\") (layer \"F.Cu\") (polygon (pts (xy 0 0) (xy 1 0) (xy 1 1))))\n\t\t(property \"Reference\" \"J1\"",
+                    1,
+                ),
+                "footprint J1 contains a zone",
+            ),
+        ];
+        for (name, board, expected) in cases {
+            assert_ne!(board, ZONES, "{name}");
+            let error = export_dsn(
+                Path::new("board.kicad_pcb"),
+                &board,
+                &native_fixture_rules(),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(expected), "{name}: {error}");
+        }
+        // `*.Cu` covers every copper layer, top to bottom.
+        let all = ZONES.replacen(plane, "(layers \"*.Cu\")\n\t\t(uuid", 1);
+        let export =
+            export_dsn(Path::new("board.kicad_pcb"), &all, &native_fixture_rules()).unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(&export.manifest).unwrap();
+        assert_eq!(
+            zone_counts(&manifest)
+                .iter()
+                .filter(|(_, net, _)| net == "GND")
+                .map(|(layer, _, count)| (layer.as_str(), *count))
+                .collect::<Vec<_>>(),
+            [("B.Cu", 2), ("F.Cu", 2), ("In1.Cu", 1), ("In2.Cu", 1)]
+        );
+    }
+
+    /// A copper layer the board marks `power` is a DSN `power` layer, where
+    /// Freerouting lays no track, as KiCad 10.0.8 writes it (`mixed` stays
+    /// `signal`); the native DSN must agree.
+    #[test]
+    fn power_layers_export_as_power_layers() {
+        let board = ZONES
+            .replacen("(4 \"In1.Cu\" signal)", "(4 \"In1.Cu\" power)", 1)
+            .replacen("(6 \"In2.Cu\" signal)", "(6 \"In2.Cu\" mixed)", 1);
+        assert_ne!(board, ZONES);
+        let export = native_baseline(&board);
+        let identity = dsn_identity(&parse_dsn_sexp(&export.dsn).unwrap()).unwrap();
+        assert_eq!(
+            identity.layer_types.values().collect::<Vec<_>>(),
+            ["signal", "power", "signal", "signal"]
+        );
+        let power_native = zones_native().replacen(
+            "(layer In1.Cu\n      (type signal)",
+            "(layer In1.Cu\n      (type power)",
+            1,
+        );
+        assert_ne!(power_native, zones_native());
+        adopt_native_dsn(native_baseline(&board), power_native.clone()).unwrap();
+        for (name, baseline, native) in [
+            (
+                "signal written as power",
+                native_baseline(ZONES),
+                power_native,
+            ),
+            (
+                "power written as signal",
+                native_baseline(&board),
+                zones_native(),
+            ),
+        ] {
+            let error = adopt_native_dsn(baseline, native).unwrap_err().to_string();
+            assert!(
+                error.contains("native DSN changed a copper layer's signal or power type"),
+                "{name}: {error}"
+            );
+        }
+    }
+
+    const BOTTOM_SIDE: &str = include_str!("../tests/fixtures/specctra_bottom_side.kicad_pcb");
+    const BOTTOM_SIDE_NATIVE_FILE: &str =
+        include_str!("../tests/fixtures/specctra_bottom_side.native-kicad-10.dsn");
+    const BOTTOM_SIDE_SES: &str = include_str!(
+        "../tests/fixtures/specctra_bottom_side.native-kicad-10.freerouting-2.3.0.ses"
+    );
+
+    /// KiCad's export of the bottom-side fixture without its courtyard
+    /// `(outline (polygon ...))` forms, which the Specctra parser behind
+    /// `validate_dsn_syntax` cannot read (#98); a form may run over lines.
+    fn bottom_side_native() -> String {
+        let mut kept = String::new();
+        let mut depth = 0i32;
+        for line in BOTTOM_SIDE_NATIVE_FILE.lines() {
+            if depth == 0 && !line.trim_start().starts_with("(outline (polygon ") {
+                kept.push_str(line);
+                kept.push('\n');
+                continue;
+            }
+            depth += line.matches('(').count() as i32 - line.matches(')').count() as i32;
+        }
+        kept
+    }
+
+    fn bottom_side_board() -> (tempfile::TempDir, std::path::PathBuf, ExportBundle) {
+        let temp = tempfile::tempdir().unwrap();
+        let board = temp.path().join("specctra_bottom_side.kicad_pcb");
+        std::fs::write(&board, BOTTOM_SIDE).unwrap();
+        let baseline = export_dsn(&board, BOTTOM_SIDE, &native_fixture_rules()).unwrap();
+        let adopted = adopt_native_dsn(baseline, bottom_side_native()).unwrap();
+        (temp, board, adopted)
+    }
+
+    /// A bottom footprint is written as KiCad writes it: its front image,
+    /// SMD pads on F.Cu, placed `back` at KiCad's rotation plus 180, a pin's
+    /// own turn mirrored. KiCad's native DSN of the same board is adopted
+    /// unchanged, so both paths give the router the same placement (#430).
+    #[test]
+    fn bottom_footprints_are_written_as_kicads_native_export_writes_them() {
+        let export = native_baseline(BOTTOM_SIDE);
+        for place in [
+            "(place R1 100000 -50000 front 0)",
+            "(place R2 110000 -50000 back 270)",
+            "(place U1 112000 -56000 back 330)",
+            "(place R3 104000 -56000 back 315)",
+            "(place J1 120000 -45000 back 180)",
+        ] {
+            assert!(export.dsn.contains(place), "{place}\n{}", export.dsn);
+        }
+        assert_eq!(export.component_side, "both");
+        let native = bottom_side_native();
+        assert_ne!(native, BOTTOM_SIDE_NATIVE_FILE);
+        let adopted = adopt_native_dsn(export, native.clone()).unwrap();
+        assert_eq!(adopted.dsn, native);
+        let manifest: serde_json::Value = serde_json::from_str(&adopted.manifest).unwrap();
+        assert_eq!(manifest["supported_profile"]["component_side"], "both");
+        let sides = manifest["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|component| {
+                (
+                    component["reference"].as_str().unwrap(),
+                    component["side"].as_str().unwrap(),
+                    component["rotation_degrees"].as_f64().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sides,
+            [
+                ("J1", "back", 180.0),
+                ("R1", "front", 0.0),
+                ("R2", "back", 270.0),
+                ("R3", "back", 315.0),
+                ("U1", "back", 330.0),
+            ]
+        );
+    }
+
+    /// KiCad's front image of the bottom SOT-23W: pin 3 alone on the right,
+    /// pins 1 and 2 above and below on the left. A mirrored image would put
+    /// them on the other side, and the native DSN would be refused.
+    #[test]
+    fn a_bottom_footprints_image_is_the_unflipped_front_one() {
+        let export = native_baseline(BOTTOM_SIDE);
+        let rotations = pin_rotations(&export.dsn);
+        assert_eq!(rotations[&("R3".to_string(), "2".to_string())], "90");
+        for pin in ["1 -1200 950)", "2 -1200 -950)", "3 1200 0)"] {
+            assert!(export.dsn.contains(pin), "{pin}\n{}", export.dsn);
+        }
+        let mirrored = bottom_side_native().replacen("3 1200 0)", "3 -1200 0)", 1);
+        let error = adopt_native_dsn(native_baseline(BOTTOM_SIDE), mirrored)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("native DSN changed pin position for component 'U1' pin '3'"),
+            "{error}"
+        );
+    }
+
+    /// An SMD pad of a bottom footprint is on B.Cu; one on F.Cu, the other
+    /// side's copper, is refused rather than moved.
+    #[test]
+    fn a_bottom_footprints_smd_pad_must_be_on_b_cu() {
+        let wrong_side = BOTTOM_SIDE.replacen(
+            r#"(layers "B.Cu" "B.Mask" "B.Paste")"#,
+            r#"(layers "F.Cu" "B.Mask" "B.Paste")"#,
+            1,
+        );
+        assert_ne!(wrong_side, BOTTOM_SIDE);
+        let error = export_dsn(
+            Path::new("board.kicad_pcb"),
+            &wrong_side,
+            &native_fixture_rules(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("unsupported SMD pad") && error.contains("copper layers are [F.Cu]"),
+            "{error}"
+        );
+        // A front footprint's SMD pad on B.Cu is still refused.
+        let front_on_back = FOUR_LAYERS.replacen(
+            r#"(layers "F.Cu" "F.Mask" "F.Paste")"#,
+            r#"(layers "B.Cu" "F.Mask" "F.Paste")"#,
+            1,
+        );
+        let error = export_dsn(
+            Path::new("board.kicad_pcb"),
+            &front_on_back,
+            &native_fixture_rules(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("copper layers are [B.Cu]"), "{error}");
+    }
+
+    /// Freerouting 2.3.0 keeps every bottom placement and routes the bottom
+    /// pads on B.Cu; the strict planner accepts the session.
+    #[test]
+    fn freerouting_routes_bottom_pads_and_the_planner_accepts_it() {
+        let (_temp, board, adopted) = bottom_side_board();
+        let plan = crate::specctra_ses::parse_import_plan(
+            &board,
+            BOTTOM_SIDE,
+            &adopted.manifest,
+            BOTTOM_SIDE_SES,
+        )
+        .unwrap();
+        let back = plan
+            .tracks
+            .iter()
+            .filter(|track| track.layer == "B.Cu")
+            .count();
+        assert!(back > 0, "{:?}", plan.tracks);
+        assert_eq!(plan.vias.len(), 3);
+    }
+
+    /// The SES must keep each footprint's side: a bottom footprint the
+    /// session puts on the front is refused.
+    #[test]
+    fn a_session_that_turns_a_footprint_over_is_refused() {
+        let (_temp, board, adopted) = bottom_side_board();
+        let flipped = BOTTOM_SIDE_SES.replacen(
+            "(place R2 1100000 -500000 back 270)",
+            "(place R2 1100000 -500000 front 270)",
+            1,
+        );
+        assert_ne!(flipped, BOTTOM_SIDE_SES);
+        let error = crate::specctra_ses::parse_import_plan(
+            &board,
+            BOTTOM_SIDE,
+            &adopted.manifest,
+            &flipped,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("SES changes placement of component 'R2'"),
+            "{error}"
+        );
+    }
+
+    /// The manifest's sides are checked against the live board and its
+    /// profile against its components, whichever DSN was routed (#72).
+    #[test]
+    fn manifest_sides_must_match_the_board_and_the_profile() {
+        let (_temp, board, adopted) = bottom_side_board();
+        let manifest: serde_json::Value = serde_json::from_str(&adopted.manifest).unwrap();
+        let plan = |manifest: &serde_json::Value| {
+            crate::specctra_ses::parse_import_plan(
+                &board,
+                BOTTOM_SIDE,
+                &manifest.to_string(),
+                BOTTOM_SIDE_SES,
+            )
+            .unwrap_err()
+            .to_string()
+        };
+
+        // R2 recorded on the front, the session too: the board says back.
+        let mut front_r2 = manifest.clone();
+        let r2 = front_r2["components"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|component| component["reference"] == "R2")
+            .unwrap();
+        r2["side"] = "front".into();
+        let error = plan(&front_r2);
+        assert!(
+            error.contains(
+                "routing manifest places R2 on the front side, the live board on the back side"
+            ),
+            "{error}"
+        );
+
+        // A profile that says front while components are on the back.
+        let mut front_profile = manifest.clone();
+        front_profile["supported_profile"]["component_side"] = "front".into();
+        let error = plan(&front_profile);
+        assert!(
+            error.contains("manifest profile side 'front' does not match its components (both)"),
+            "{error}"
+        );
+
+        let mut unknown = manifest.clone();
+        unknown["supported_profile"]["component_side"] = "top".into();
+        let error = plan(&unknown);
+        assert!(
+            error.contains("manifest does not describe the supported first routing profile"),
+            "{error}"
+        );
+    }
+
+    /// The profile side is derived from the footprints.
+    #[test]
+    fn the_profile_side_is_derived_from_the_footprints() {
+        assert_eq!(native_baseline(FOUR_LAYERS).component_side, "front");
+        assert_eq!(native_baseline(BOTTOM_SIDE).component_side, "both");
+    }
+
+    /// KiCad's stock TO-252-2 as U1 on the front and TO-263-2 as U2 flipped
+    /// to the bottom: each has four unnumbered paste-aperture pads over its
+    /// tab (#458). See its README.
+    const PASTE_PADS: &str = include_str!("../tests/fixtures/specctra_paste_pads.kicad_pcb");
+    const PASTE_PADS_NATIVE_FILE: &str =
+        include_str!("../tests/fixtures/specctra_paste_pads.native-kicad-10.dsn");
+    const PASTE_PADS_SES: &str =
+        include_str!("../tests/fixtures/specctra_paste_pads.native-kicad-10.freerouting-2.5.0.ses");
+
+    /// KiCad's export of the paste-pad fixture without its courtyard
+    /// `(outline (polygon ...))` forms, which `validate_dsn_syntax` cannot
+    /// read (#98); a form may run over lines.
+    fn paste_pads_native() -> String {
+        let mut kept = String::new();
+        let mut depth = 0i32;
+        for line in PASTE_PADS_NATIVE_FILE.lines() {
+            if depth == 0 && !line.trim_start().starts_with("(outline (polygon ") {
+                kept.push_str(line);
+                kept.push('\n');
+                continue;
+            }
+            depth += line.matches('(').count() as i32 - line.matches(')').count() as i32;
+        }
+        kept
+    }
+
+    fn non_copper_pads(manifest: &serde_json::Value, reference: &str) -> Vec<(String, String)> {
+        manifest["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|component| component["reference"] == reference)
+            .unwrap()["non_copper_pads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|pad| {
+                (
+                    pad["pad_number"].as_str().unwrap().to_string(),
+                    pad["layers"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|layer| layer.as_str().unwrap())
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                )
+            })
+            .collect()
+    }
+
+    /// A pad on no copper layer is left out of the DSN image, as KiCad's
+    /// own export does, and listed in the manifest with its layers: front
+    /// apertures on F.Paste, bottom ones on B.Paste. KiCad's native DSN of
+    /// the same board is adopted unchanged (#458).
+    #[test]
+    fn paste_apertures_stay_out_of_the_dsn_and_in_the_manifest() {
+        let export = native_baseline(PASTE_PADS);
+        let pins = |image: &str| {
+            let start = export.dsn.find(&format!("(image {image}")).unwrap();
+            let body = &export.dsn[start..];
+            let end = body.find("\n    (image ").unwrap_or(body.len());
+            body[..end].matches("(pin ").count()
+        };
+        assert_eq!(pins("copperpour_image_U1"), 3);
+        assert_eq!(pins("copperpour_image_U2"), 3);
+        let manifest: serde_json::Value = serde_json::from_str(&export.manifest).unwrap();
+        assert_eq!(manifest["schema_version"], MANIFEST_SCHEMA_VERSION);
+        let front = vec![(String::new(), "F.Paste".to_string()); 4];
+        let back = vec![(String::new(), "B.Paste".to_string()); 4];
+        assert_eq!(non_copper_pads(&manifest, "U1"), front);
+        assert_eq!(non_copper_pads(&manifest, "U2"), back);
+        // A footprint without such pads writes no list.
+        let r1 = manifest["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|component| component["reference"] == "R1")
+            .unwrap();
+        assert!(r1.get("non_copper_pads").is_none(), "{r1}");
+        let native = paste_pads_native();
+        let adopted = adopt_native_dsn(export, native.clone()).unwrap();
+        assert_eq!(adopted.dsn, native);
+    }
+
+    /// The live board's identities carry the same pads on no copper layer,
+    /// so the importer compares them with the manifest (#458).
+    #[test]
+    fn live_identities_list_the_pads_on_no_copper_layer() {
+        let live = board_pin_identities(PASTE_PADS).unwrap();
+        let u1 = live
+            .values()
+            .find(|footprint| footprint.pins.iter().any(|pin| pin.dsn_pin == "U1-2"))
+            .unwrap();
+        assert_eq!(u1.pins.len(), 3);
+        assert_eq!(u1.non_copper_pads.len(), 4);
+        assert!(u1
+            .non_copper_pads
+            .iter()
+            .all(|pad| pad.pad_number.is_empty() && pad.layers == ["F.Paste"]));
+    }
+
+    /// Freerouting routes KiCad's native DSN, which has no aperture pads,
+    /// and the strict planner accepts the session against the manifest.
+    #[test]
+    fn a_session_for_a_board_with_paste_apertures_is_accepted() {
+        let temp = tempfile::tempdir().unwrap();
+        let board = temp.path().join("specctra_paste_pads.kicad_pcb");
+        std::fs::write(&board, PASTE_PADS).unwrap();
+        let baseline = export_dsn(&board, PASTE_PADS, &native_fixture_rules()).unwrap();
+        let adopted = adopt_native_dsn(baseline, paste_pads_native()).unwrap();
+        let plan = crate::specctra_ses::parse_import_plan(
+            &board,
+            PASTE_PADS,
+            &adopted.manifest,
+            PASTE_PADS_SES,
+        )
+        .unwrap();
+        assert!(!plan.tracks.is_empty());
+        assert_eq!(plan.vias.len(), 2);
+    }
+
+    /// Only a pad with no copper at all is set aside: an unnumbered pad
+    /// with copper is still refused.
+    #[test]
+    fn an_unnumbered_pad_with_copper_is_still_refused() {
+        let with_copper =
+            PASTE_PADS.replacen(r#"(layers "F.Paste")"#, r#"(layers "F.Cu" "F.Paste")"#, 1);
+        assert_ne!(with_copper, PASTE_PADS);
+        let error = export_dsn(
+            Path::new("board.kicad_pcb"),
+            &with_copper,
+            &native_fixture_rules(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("footprint contains an unnumbered pad"),
+            "{error}"
+        );
+    }
+
+    /// Only an `smd` pad is set aside: a drilled pad on no copper layer
+    /// (a mounting hole with its copper removed) is still refused.
+    #[test]
+    fn a_drilled_pad_on_no_copper_layer_is_still_refused() {
+        for pad_type in ["np_thru_hole", "thru_hole"] {
+            let drilled = PASTE_PADS.replacen(
+                r#"(pad "" smd roundrect"#,
+                &format!(r#"(pad "" {pad_type} roundrect"#),
+                1,
+            );
+            assert_ne!(drilled, PASTE_PADS);
+            let error = export_dsn(
+                Path::new("board.kicad_pcb"),
+                &drilled,
+                &native_fixture_rules(),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains("footprint contains an unnumbered pad"),
+                "{pad_type}: {error}"
+            );
+        }
+    }
+
+    /// Two pads on no copper layer that share a UUID are refused at export,
+    /// as the import side refuses them in the manifest.
+    #[test]
+    fn a_pad_on_no_copper_layer_with_a_repeated_uuid_is_refused() {
+        let repeated = PASTE_PADS.replacen(
+            "aed7a5d2-2a7b-418d-86bb-2b666374d871",
+            "a6cc1fb6-c476-4559-8318-c7e768ea2507",
+            1,
+        );
+        assert_ne!(repeated, PASTE_PADS);
+        let error = export_dsn(
+            Path::new("board.kicad_pcb"),
+            &repeated,
+            &native_fixture_rules(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains(
+                "pad on no copper layer of U1 repeats the UUID a6cc1fb6-c476-4559-8318-c7e768ea2507"
+            ),
             "{error}"
         );
     }

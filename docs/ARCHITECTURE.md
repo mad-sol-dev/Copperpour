@@ -75,12 +75,23 @@ request/reply transport, typed board operations, and the distinction among an
 unreachable transport, a requested board positively absent from KiCad's complete
 open-document set, an ambiguous document set, and a request KiCad rejected.
 
+### Shared viewer engine
+
+`crates/copperpour-viewer` owns sheet discovery, snapshot SVG rendering,
+incremental cache selection and event-batching helpers. It is a workspace
+member with no Tauri or GUI dependency. Its `browser` module adds a root-bound
+loopback HTTP/SSE service with owned watcher/render tasks. Browser frontend assets
+are embedded from `crates/copperpour-viewer/frontend`.
+The MCP launch tool uses the browser service. A `ToolContext` registry serializes
+starts and reuses an instance per canonical root; dropping the context signals
+shutdown of its viewers. Browser-launch status describes the OS opener separately
+from successful service startup. The standalone Tauri application has been retired;
+there is no separate viewer process or GUI build.
+
 ### Non-workspace and non-Rust boundaries
 
-`crates/schematic-viewer` is a separate Tauri application and is deliberately
-outside the Cargo workspace. `plugin` is the thin Python KiCad integration
-layer. `packaging` contains the PCM build scripts, metadata, schema, and package
-validation. Bundled AI guidance under `crates/copperpour/assets/skills` and
+`plugin` is the thin Python KiCad integration layer. `packaging` contains the
+PCM build scripts, metadata, schema, and package validation. Bundled AI guidance under `crates/copperpour/assets/skills` and
 `assets/agents` is user-facing workflow behavior and must track the tools it
 names.
 
@@ -100,6 +111,17 @@ crates/copperpour/src/main.rs
 The latter exists for clients that do not refresh after
 `notifications/tools/list_changed`; the configuration contract is documented
 beside the fields in `crates/copperpour/src/config.rs`.
+
+## Server guidance
+
+`copperpour-core::guidance` owns one embedded catalog consumed by both MCP
+endpoints and the standalone skill installer. `initialize` always combines short
+operating rules with the optional drift notice. The always-visible `get_guidance`
+meta-tool and `resources/list` / `resources/read` expose the same immutable
+skill/reference bytes. Resource identities use `copperpour://guidance/` and match
+exactly against the catalog, with no filesystem reads or URL normalization.
+Resources are static for a running build; upgrades require reconnecting to the
+new server. Client-side adoption of guidance is separate from successful delivery.
 
 ## Listing, Loading, And Calling Tools
 

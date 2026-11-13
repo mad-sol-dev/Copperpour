@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Schematic Viewer</title>
+<style>
+  :root {
+    --bg: #1a1a2e;
+    --toolbar-bg: #16213e;
+    --toolbar-border: #0f3460;
+    --btn-bg: #0f3460;
+    --btn-border: #533483;
+    --btn-hover: #533483;
+    --text: #e0e0e0;
+    --text-dim: #888;
+    --accent: #e94560;
+    --overlay-h: #533483;
+    --overlay-p: #666;
+  }
+  body.light {
+    --bg: #f5f5f5;
+    --toolbar-bg: #e8e8ee;
+    --toolbar-border: #c5c5d5;
+    --btn-bg: #dcdce6;
+    --btn-border: #9a8fc0;
+    --btn-hover: #c9bfe4;
+    --text: #24243a;
+    --text-dim: #667;
+    --accent: #c22b47;
+    --overlay-h: #7a6bb0;
+    --overlay-p: #999;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    overflow: hidden;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* Toolbar */
+  .toolbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 12px;
+    background: var(--toolbar-bg);
+    border-bottom: 1px solid var(--toolbar-border);
+    z-index: 10;
+    flex-shrink: 0;
+  }
+  .toolbar button {
+    background: var(--btn-bg);
+    border: 1px solid var(--btn-border);
+    color: var(--text);
+    padding: 5px 12px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 13px;
+  }
+  .toolbar button:hover { background: var(--btn-hover); }
+  .toolbar .spacer { flex: 1; }
+  .toolbar .status {
+    font-size: 12px;
+    color: var(--text-dim);
+    max-width: 32vw;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .toolbar .zoom-display {
+    font-size: 13px;
+    color: var(--text-dim);
+    min-width: 60px;
+    text-align: center;
+  }
+  .toolbar .filename {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--accent);
+  }
+  .toolbar select#sheet-selector {
+    background: var(--btn-bg);
+    border: 1px solid var(--btn-border);
+    color: var(--text);
+    padding: 5px 8px;
+    border-radius: 4px;
+    font-size: 13px;
+    max-width: 240px;
+  }
+  .toolbar select#sheet-selector[hidden] { display: none; }
+
+  /* SVG Container */
+  #viewer {
+    flex: 1;
+    overflow: hidden;
+    position: relative;
+    cursor: grab;
+  }
+  #viewer.dragging { cursor: grabbing; }
+  #viewer svg, #viewer img {
+    position: absolute;
+    transform-origin: 0 0;
+  }
+  #svg-container {
+    position: absolute;
+    transform-origin: 0 0;
+  }
+
+  /* Loading / empty state */
+  .overlay {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    text-align: center;
+    z-index: 5;
+  }
+  .overlay h2 { color: var(--overlay-h); margin-bottom: 8px; }
+  #viewer .overlay .logo { position: static; display: block; width: 64px; height: 64px; margin: 0 auto 12px; }
+  .overlay p { color: var(--overlay-p); font-size: 14px; }
+  .overlay .spinner {
+    width: 40px;
+    height: 40px;
+    border: 4px solid var(--btn-border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    margin: 0 auto 12px;
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* Update / error flash: centered just below the toolbar, big enough to
+     catch the eye (top-right small text went unnoticed in real testing).
+     pointer-events: none is load-bearing, not cosmetic — opacity: 0 still
+     hit-tests, and this element previously sat invisible over the toolbar's
+     right-side buttons, silently swallowing their clicks. */
+  .flash {
+    position: fixed;
+    top: 48px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--btn-bg);
+    color: var(--accent);
+    padding: 10px 22px;
+    border: 1px solid var(--accent);
+    border-radius: 6px;
+    font-size: 15px;
+    font-weight: 600;
+    text-align: center;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45);
+    opacity: 0;
+    transition: opacity 0.3s;
+    z-index: 30;
+    max-width: 80vw;
+    pointer-events: none;
+  }
+  .flash.visible { opacity: 1; }
+  .flash.error { background: #5c1a2a; color: #ffb3c0; border-color: #ffb3c0; }
+</style>
+</head>
+<body>
+
+<div class="toolbar">
+  <span class="filename" id="filename">No file loaded</span>
+  <select id="sheet-selector" hidden></select>
+  <!-- Status sits on the left of the flexible spacer: its text changes
+       constantly (Live / Rendering / errors), and when it lived at the far
+       right it kept shifting the buttons sideways under the cursor. -->
+  <span class="status" id="status">Waiting...</span>
+  <div class="spacer"></div>
+  <button data-action="zoomIn" title="Zoom in (+)">Zoom +</button>
+  <button data-action="zoomOut" title="Zoom out (-)">Zoom -</button>
+  <span class="zoom-display" id="zoom-display">100%</span>
+  <button data-action="fitToPage" title="Fit to window (0)">Fit</button>
+  <button data-action="manualRefresh" title="Re-render the current sheet (R)">Refresh</button>
+  <button data-action="toggleTheme" title="Toggle dark/light theme">Theme</button>
+  <button data-action="openInKicad" title="Open this project in KiCAD">Open in KiCAD</button>
+</div>
+
+<div id="viewer">
+  <div id="svg-container"></div>
+  <div class="overlay" id="empty-state">
+    <svg class="logo" viewBox="0 0 256 256" role="img" aria-label="Copperpour logo">
+      <rect x="4" y="4" width="248" height="248" rx="40" fill="#B87333"/>
+      <rect x="18" y="18" width="220" height="220" rx="28" fill="none" stroke="#E8A86E" stroke-width="10"/>
+      <text x="128" y="128" dy="0.355em" text-anchor="middle" fill="#FFFFFF"
+            font-family="Liberation Sans, Arial, Helvetica, sans-serif" font-weight="700" font-size="132">Cu</text>
+    </svg>
+    <h2>Copperpour</h2>
+    <p>Schematic Viewer</p>
+    <p id="open-prompt" style="margin-top:12px">This viewer shows the schematic selected at launch.</p>
+  </div>
+  <div class="overlay" id="loading-overlay" style="display:none;">
+    <div class="spinner"></div>
+    <h2 id="loading-text">Rendering…</h2>
+  </div>
+</div>
+
+<div class="flash" id="flash">Updated</div>
+
+<script src="viewer.js"></script>
+</body>
+</html>

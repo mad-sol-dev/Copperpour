@@ -42,10 +42,46 @@ also checked after CLI.
 This detects a changed final source, but cannot prove the absence of transient
 concurrent changes; callers must finish their mutations first. General live/file
 authority and the shared outcome-envelope migration remain tracked separately
-in [#58](https://github.com/Copperpour/Copperpour/issues/58) and
-[#16](https://github.com/Copperpour/Copperpour/issues/16); this synchronization does
-not close
-those larger contracts.
+in [#58](https://github.com/Copperpour/Copperpour/issues/58); response bounding
+does not complete that migration.
+
+## Bounded responses and complete reports
+
+Both DRC tools display at most `limit` severity-filtered violations (default 50;
+0 for counts only). `shown` equals the returned list length; `truncated` means
+`filtered_count` exceeds `shown`. Filtering and bounding include every reported
+category, in the existing order: design-rule violations, unconnected items, then
+schematic parity. Existing totals and `run_drc` error/warning counts are computed
+before bounding. Missing categories remain `null` and appear in
+`categories_not_reported`.
+
+The optional `output` report includes every reported category and severity,
+regardless of `limit` or `severity`. Bounding does not reduce the checks KiCad runs
+or alter synchronization, refill, report publication, or source evidence. Raise
+`limit` for a larger sample or inspect the full report; there is no pagination.
+This limits row counts, not bytes or nested violation items.
+
+## Rule summaries and selection
+
+`run_drc` adds `by_rule`, an object keyed by the exact rule names in the complete
+filtered result. Each value has `errors` and `warnings`, counted before `limit`
+is applied, even with `limit: 0`. The buckets count those two severities, matching
+the global error/warning counters. With `severity: "info"`, informational rows
+still contribute to `filtered_count` and the displayed list; a rule with only
+informational rows appears with zero errors and zero warnings.
+
+The optional `rules` array selects exact, case-sensitive rule names for the
+response. Omit it for all rules; an empty array selects none. Duplicate names
+are coalesced. `rules_filter` reports the sorted, distinct effective selection,
+or `null` when all rules are included. Unknown names produce no matching rows.
+`filtered_count`, `errors`, `warnings`, `by_rule`, `shown`, `truncated`, and
+`violations` all describe the set after both severity and rule selection.
+
+The category counts and `total_violations` remain full-report counts, and
+`output` still contains every reported category and severity. Rule selection
+changes presentation only: KiCad still runs the complete configured DRC ruleset.
+Use a rule name returned in `by_rule` to inspect a less common rule without the
+response's display limit being spent on another rule's repeated findings.
 
 ## Evidence
 

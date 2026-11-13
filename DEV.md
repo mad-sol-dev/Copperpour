@@ -18,7 +18,6 @@ cargo check                          # ~15s
 cargo test --workspace --lib --tests # all tests
 cargo test -p copperpour-core -p copperpour --no-default-features --lib --tests  # the offline build (#210)
 cargo build --release -p copperpour     # MCP server binary
-cd crates/schematic-viewer && cargo build --release   # viewer (separate crate)
 ```
 
 ### Nix
@@ -81,16 +80,14 @@ crates/
 │   └── proto/ (from KiCad v10) · build.rs (prost) · src/ gen.rs · client.rs (NNG
 │       req/rep) · builders.rs (protobuf helpers, mm→nm) · transform.rs (footprint
 │       children are ABSOLUTE board coords, mixelpixx/Konnect#23) · types.rs
-└── schematic-viewer/            # Tauri app, outside the workspace
-    └── capabilities/default.json (core:default grant — without it event.listen() is
-        silently denied) · src/main.rs (multi-sheet watcher, snapshot-isolated
-        incremental kicad-cli SVG render) · frontend/index.html (pan/zoom, sheets)
+└── copperpour-viewer/           # Viewer engine and loopback browser service
+    └── frontend/               # Embedded browser page and script
 plugin/      Python launcher inside KiCad: __init__.py (PCB-editor ActionPlugin settings
              dialog) · settings_dialog.py · native_bridge.py (see Plugin) · plugin.json
 packaging/   build-pcm.{ps1,sh} (one platform) · merge-pcm.py + pcm-launcher.sh (all
              platforms, #398) · metadata.json · validate-pcm.py · schema/ · resources/
 .github/workflows/  disabled on GitHub; local CI runs their jobs (GOVERNANCE.md)
-    ci.yml        check+test (Linux, Windows), clippy, fmt, viewer, Python plugin,
+    ci.yml        check+test (Linux, Windows), clippy, fmt, Python plugin,
                   Nix, PCM validation, licenses, offline build — per PR
     e2e-kicad.yml real KiCad 10.0.5: e2e suite, demo-corpus conformance, PCM;
                   release gate, on request for a PR
@@ -313,11 +310,9 @@ Router: `crates/copperpour-core/src/router/mod.rs`.
   notably Chocolatey and scoop shims. Debian/Ubuntu need `protobuf-compiler` **and**
   `libprotobuf-dev`, Fedora `protobuf-compiler` and `protobuf-devel`; otherwise the build
   fails with `google/protobuf/any.proto: File not found`.
-- Schematic viewer: Tauri 2 prerequisites (WebView2 on Windows, usually present). At
-  runtime it finds `kicad-cli` in the standard install paths, then PATH, or
-  `--kicad-cli <path>`. On Windows, if `cargo` is missing in a fresh shell, run
-  `set PATH=%PATH%;%USERPROFILE%\.cargo\bin`, and close the viewer before rebuilding (a
-  running `.exe` is locked, so linking fails).
+- Browser schematic viewer: included in the MCP server; needs a browser and `kicad-cli`.
+  Configure the server’s `kicad_cli` or let normal CLI discovery find KiCad.
+  No separate viewer binary or WebView runtime is required.
 
 ## Build Features
 
@@ -354,14 +349,45 @@ Run all: `PROTOC=<path> cargo test --workspace --lib --tests`
 | `copperpour-core` integration | Fixtures: parse, edit, write, observability, structured errors |
 | `copperpour-schematic-editor` | Typed model + round-tripping |
 | `copperpour-ipc` unit | Protobuf builders, client messages, rigid-body child transform |
+| `copperpour-viewer` unit | Sheet discovery, snapshot rendering, cache selection and event batching |
 | `crates/copperpour/tests/` | stdio protocol, doc/asset count guards, transaction CLI, `#[ignore]`d live-KiCad tests |
 
-`schematic-viewer` is in `[workspace] exclude`, so `--workspace` never builds it; CI's
-`viewer` job runs its `cargo check` and `cargo test`. Locally:
-`cd crates/schematic-viewer && cargo test`. Its unit tests cover the pure logic
-(`walk_sheet_tree`, `compute_watch_dirs`, `snapshot_tree`, `drain_until_quiet`,
-`files_needing_render`, `render_all` errors); the `kicad-cli` call and Tauri plumbing stay
-thin and untested, like other `kicad-cli` callers.
+The viewer engine, browser service and embedded frontend are in the workspace
+crate `copperpour-viewer`; workspace checks cover them without GTK, WebKit or a
+display. Its HTTP/SSE tests cover the service; `examples/browser_viewer.rs` is
+the local development entry point. Browser execution and native renderer smoke
+checks remain separate evidence. The MCP launch tool owns viewers through a
+registry on `ToolContext` until the server context ends. `open_browser: false`
+suppresses the OS opener; successful service starts return a private credential
+URL. See [the viewer README](crates/copperpour-viewer/README.md).
+
+The standalone Tauri crate, binary and separate CI job have been removed under
+[the retirement migration](docs/api-migrations/retire-standalone-viewer.md).
+Build only the MCP server; PCM packaging embeds the browser viewer with it.
+
+## Server-delivered guidance
+
+Every `initialize` response includes short Copperpour operating rules plus any
+one-time installed-guidance drift notice. The embedded bundle catalog in
+`copperpour-core/src/guidance/bundle.rs` is shared with the native installer’s
+manifest, so serving and installing a file use the same bytes. Asset sources
+remain under `crates/copperpour/assets/skills`; the reliability reference comes
+from `docs/RELIABILITY_CONTRACT.md`.
+
+`get_guidance` is an always-visible meta-tool. Without `path` it lists bundle
+paths; with an exact listed path it returns the same `contents` as
+`resources/read`. The resource namespace is `copperpour://guidance/`, with each
+skill’s `SKILL.md` and `references/` listed separately. Relative Markdown links
+resolve inside that skill’s resource directory; tool callers supply the full
+listed bundle path. Neither endpoint reads local files, downloads content or
+installs guidance. Both stdio and HTTP use the same core handler.
+
+The static catalog advertises `resources: {}`: no subscriptions, list-change
+notifications, templates or pagination. Unknown URIs return JSON-RPC `-32002`;
+malformed requests or continuation cursors return `-32602`. Tool errors retain
+the structured `invalid_argument` contract. `init`, `status`, `uninstall`, local
+drift detection and Claude hooks keep their existing behavior. Custom skill
+roots and setup snippets are later #461 phases.
 
 ## Adding a New Tool
 
@@ -383,7 +409,7 @@ checked readers for domain rules.
 
 ## Current Stats
 
-- **22 toolsets, 257 tools** + 8 meta-tools (5 routing + 2 observability + 1 runtime
+- **23 toolsets, 257 tools** + 8 meta-tools (5 routing + 2 observability + 1 runtime
   diagnostic — see `tool-directory.md`). The standalone Unix executable adds
   `reload_server` over stdio only — not embedded, HTTP, mixed transport or Windows.
 - Baseline `tools/list`: 22 tools / ~2K tokens. Full catalogue: 265 tools (257 registered + 8 meta) / ~25K tokens.

@@ -12,6 +12,7 @@ use crate::tools::{
     with_board_ipc_classified, with_bound_board_ipc_classified, BoardBinding, ToolContext, ToolDef,
 };
 use anyhow::Context;
+use copperpour_ipc::types::IpcTraceModify;
 use copperpour_sexp::writer::{apply_edits, write_atomic_if_unchanged, SexpEdit};
 use prost::Message;
 use serde_json::json;
@@ -146,7 +147,7 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "apply_specctra_ses",
-            "Apply a fully validated Freerouting SES to the exact live KiCad board as one undo transaction, without saving over the source. Creates a new candidate .kicad_pcb, proves IPC read-back counts, and runs KiCad DRC on it under the source project's netclasses and custom rules before committing.",
+            "Apply a fully validated Freerouting SES to the exact live KiCad board as one undo transaction, without saving over the source. Creates a new candidate .kicad_pcb, proves IPC read-back counts, and runs KiCad DRC on it under the source project's netclasses and custom rules before committing. It never creates, changes, deletes or refills a copper zone: when the board has zones, zone_refill.required is true, and the DRC ran on the fills as exported; refill them afterwards (refill_zones, or run_drc with refill_zones and sync_live_board).",
             json!({
                 "type": "object",
                 "properties": {
@@ -270,7 +271,9 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "modify_trace",
-            "Modify a trace segment by deleting and re-adding it with new parameters.",
+            "Change a trace segment in place, keeping its UUID, in one KiCad undo step. \
+             Refuses, leaving the board unchanged, when the UUID is not a trace segment \
+             or the board has no such net or copper layer.",
             json!({
                 "type": "object",
                 "properties": {
@@ -515,6 +518,47 @@ fn board_is_kicad_10(tree: &copperpour_sexp::SexpNode) -> bool {
     copperpour_sexp::net::names_nets_in_place(tree)
 }
 
+/// Validate caller-selected routing state on the exact board that will be written.
+/// Domain refusals are values, so the IPC wrapper cannot misclassify them as transport errors.
+fn routing_preflight(
+    client: &copperpour_ipc::client::KiCadIpcClient,
+    document: &copperpour_ipc::gen::kiapi::common::types::DocumentSpecifier,
+    layer: Option<&str>,
+    nets: &[(&str, &str)],
+) -> anyhow::Result<Option<CallToolResult>> {
+    if let Some(layer) = layer {
+        let id = copperpour_ipc::builders::try_layer_from_name(layer)? as i32;
+        let enabled = client.get_layers_in(document.clone())?;
+        if enabled.is_empty() {
+            anyhow::bail!("KiCad returned an empty enabled-layer set for the requested board");
+        }
+        if !enabled.iter().any(|enabled| enabled.id == id) {
+            let copper: Vec<_> = enabled
+                .iter()
+                .filter(|enabled| copperpour_sexp::layers::is_copper_name(&enabled.name))
+                .map(|enabled| enabled.name.as_str())
+                .collect();
+            return Ok(Some(invalid_arg(
+                "layer",
+                &format!(
+                    "the board has no copper layer '{layer}'; it has {}. The board is unchanged.",
+                    copper.join(", ")
+                ),
+            )));
+        }
+    }
+    let available = client.get_nets_required_in(document.clone())?;
+    for &(field, name) in nets {
+        if !available.iter().any(|net| net.name == name) {
+            return Ok(Some(invalid_arg(
+                field,
+                &format!("the board has no net '{name}'. The board is unchanged."),
+            )));
+        }
+    }
+    Ok(None)
+}
+
 async fn handle_route_trace(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -547,8 +591,18 @@ async fn handle_route_trace(
 
     let net_ipc = net_name.clone();
     let layer_ipc = layer.clone();
-    ipc!(ctx, args, |c| c
-        .add_track(&net_ipc, &layer_ipc, width, x1, y1, x2, y2));
+    let routed = ipc!(ctx, args, |c, document| {
+        if let Some(refusal) =
+            routing_preflight(c, &document, Some(&layer_ipc), &[("net_name", &net_ipc)])?
+        {
+            return Ok(Err(refusal));
+        }
+        c.add_tracks_in(document, &net_ipc, &layer_ipc, width, &[(x1, y1, x2, y2)])?;
+        Ok(Ok(()))
+    });
+    if let Err(refusal) = routed {
+        return Ok(refusal);
+    }
     Ok(CallToolResult::json(&json!({
         "net": net_name, "layer": layer, "width": width,
         "from": { "x": x1, "y": y1 }, "to": { "x": x2, "y": y2 }
@@ -591,14 +645,19 @@ async fn handle_route_pad_to_pad(
     let (net_ipc, layer_ipc) = (net_name.clone(), layer.clone());
     let ends = [(ref1.clone(), pad1.clone()), (ref2.clone(), pad2.clone())];
     let routed = ipc!(ctx, args, |c, document| {
+        if let Some(refusal) =
+            routing_preflight(c, &document, Some(&layer_ipc), &[("net_name", &net_ipc)])?
+        {
+            return Ok(Err(refusal));
+        }
         let [(ref1, pad1), (ref2, pad2)] = &ends;
         let (x1, y1) = match get_live_pad(c, &document, ref1, pad1)? {
             Ok(at) => at,
-            Err(message) => return Ok(Err(message)),
+            Err(message) => return Ok(Err(CallToolResult::error(message))),
         };
         let (x2, y2) = match get_live_pad(c, &document, ref2, pad2)? {
             Ok(at) => at,
-            Err(message) => return Ok(Err(message)),
+            Err(message) => return Ok(Err(CallToolResult::error(message))),
         };
         let segments: &[_] = if (x1 - x2).abs() < 0.01 || (y1 - y2).abs() < 0.01 {
             // Already axis-aligned: single segment
@@ -612,7 +671,7 @@ async fn handle_route_pad_to_pad(
     });
     let ((x1, y1), (x2, y2)) = match routed {
         Ok(ends) => ends,
-        Err(message) => return Ok(CallToolResult::error(message)),
+        Err(refusal) => return Ok(refusal),
     };
 
     Ok(CallToolResult::json(&json!({
@@ -664,8 +723,17 @@ async fn handle_add_via(
     let pad_size = args["pad_size"].as_f64().unwrap_or(0.8);
 
     let net_ipc = net_name.clone();
-    let placement = ipc!(ctx, args, |c, document| c
-        .add_via_verified_in(document, &net_ipc, x, y, drill, pad_size));
+    let placement = ipc!(ctx, args, |c, document| {
+        if let Some(refusal) = routing_preflight(c, &document, None, &[("net_name", &net_ipc)])? {
+            return Ok(Err(refusal));
+        }
+        c.add_via_verified_in(document, &net_ipc, x, y, drill, pad_size)
+            .map(Ok)
+    });
+    let placement = match placement {
+        Ok(placement) => placement,
+        Err(refusal) => return Ok(refusal),
+    };
     match placement {
         copperpour_ipc::IpcViaPlacement::Placed(via) => Ok(CallToolResult::json(&json!({
             "uuid": via.uuid,
@@ -938,6 +1006,7 @@ async fn handle_plan_specctra_ses_import(
                 "tracks": plan.locked_track_count,
                 "vias": plan.locked_via_count
             },
+            "zone_refill": zone_refill(&plan.zones),
             "tracks": plan.tracks,
             "arcs": plan.arcs,
             "vias": plan.vias,
@@ -970,6 +1039,22 @@ struct ApplyEvidence {
     schematic_parity_violations: usize,
     project_rules_applied: bool,
     creepage_skipped: bool,
+    zones: Vec<crate::specctra::ManifestZoneCount>,
+}
+
+/// What an SES import says about the board's copper zones: it never touches
+/// them, so their fills predate its routing. A declared consequence of the
+/// import, derived from the manifest's zone inventory, not an observation of
+/// the fills (#71, #430).
+fn zone_refill(zones: &[crate::specctra::ManifestZoneCount]) -> serde_json::Value {
+    let required = !zones.is_empty();
+    json!({
+        "required": required,
+        "zones": zones,
+        "remedy": required.then_some(
+            "the import does not refill zones: refill them (refill_zones, or run_drc with refill_zones and sync_live_board) before judging DRC"
+        )
+    })
 }
 
 fn created_route_item_ids(items: &[prost_types::Any]) -> anyhow::Result<Vec<String>> {
@@ -1226,6 +1311,7 @@ async fn handle_apply_specctra_ses(
                 schematic_parity_violations: parity_count,
                 project_rules_applied,
                 creepage_skipped: drc.creepage_skipped,
+                zones: plan.zones.clone(),
             })
         })();
         match operation {
@@ -1295,7 +1381,8 @@ async fn handle_apply_specctra_ses(
                 "schematic_parity_violations": evidence.schematic_parity_violations,
                 "project_rules_applied": evidence.project_rules_applied,
                 "creepage_skipped": evidence.creepage_skipped
-            }
+            },
+            "zone_refill": zone_refill(&evidence.zones)
         }))),
         Err(failure) => {
             let reason = failure.message().to_string();
@@ -1803,7 +1890,32 @@ async fn handle_get_nets_list(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let nets = ipc!(ctx, args, |c| c.get_nets());
+    let board_path = get_path(args, "board")?;
+    let unavailable = |reason: &str| {
+        let message = format!(
+            "KiCad did not complete the net list query for '{}': {reason}. Retry the live query; no saved-file or empty-list substitute was used.",
+            board_path.display()
+        );
+        CallToolResult::error_kind(
+            ToolErrorKind::EditorUnavailable {
+                editor: "pcb".to_string(),
+                reason: message.clone(),
+            },
+            message,
+        )
+    };
+    let nets = match with_bound_board_ipc_classified(ctx, &board_path, |client, document| {
+        client.get_nets_in(document)
+    })
+    .await?
+    {
+        Ok(BoardBinding::Bound(nets)) => nets,
+        Err(copperpour_ipc::IpcFailure::Target { error, .. }) => {
+            return Ok(crate::tools::ipc_target_error_result(&error));
+        }
+        Ok(BoardBinding::Unserved { message, .. }) => return Ok(unavailable(&message)),
+        Err(error) => return Ok(unavailable(error.message())),
+    };
     let items: Vec<serde_json::Value> = nets
         .iter()
         .map(|n| json!({ "name": n.name, "netcode": n.netcode }))
@@ -1845,20 +1957,61 @@ async fn handle_modify_trace(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let width = args["width"].as_f64().unwrap_or(0.25);
+    let width = match opt_positive_f64(args, "width") {
+        Ok(v) => v.unwrap_or(0.25),
+        Err(e) => return Ok(e),
+    };
 
-    let uuid_ipc = uuid.clone();
-    let net_ipc = net_name.clone();
-    let layer_ipc = layer.clone();
-    ipc!(ctx, args, |c| {
-        c.delete_track(&uuid_ipc)?;
-        c.add_track(&net_ipc, &layer_ipc, width, x1, y1, x2, y2)
-    });
-    Ok(CallToolResult::json(&json!({
-        "modified_uuid": uuid,
-        "net": net_name, "layer": layer, "width": width,
-        "from": { "x": x1, "y": y1 }, "to": { "x": x2, "y": y2 }
-    })))
+    let board = get_path(args, "board")?;
+    let (uuid_ipc, net_ipc, layer_ipc) = (uuid.clone(), net_name.clone(), layer.clone());
+    let outcome = match with_board_ipc_classified(ctx, &board, move |client, document| {
+        let edit = copperpour_ipc::types::IpcTrackEdit {
+            net_name: &net_ipc,
+            layer: &layer_ipc,
+            width,
+            start: copperpour_ipc::types::IpcVector2 { x: x1, y: y1 },
+            end: copperpour_ipc::types::IpcVector2 { x: x2, y: y2 },
+        };
+        client.modify_trace_segment_verified(document, &uuid_ipc, &edit)
+    })
+    .await?
+    {
+        Ok(outcome) => outcome,
+        Err(failure) => return Ok(crate::tools::ipc_failure_result(failure)),
+    };
+    let unchanged = "The board is unchanged.";
+    Ok(match outcome {
+        IpcTraceModify::Modified => CallToolResult::json(&json!({
+            "modified_uuid": uuid,
+            "net": net_name, "layer": layer, "width": width,
+            "from": { "x": x1, "y": y1 }, "to": { "x": x2, "y": y2 }
+        })),
+        IpcTraceModify::NotFound => CallToolResult::error_kind(
+            ToolErrorKind::StaleTarget {
+                target: uuid,
+                reason: "the UUID is not an observed trace segment on the requested board"
+                    .to_string(),
+            },
+            format!(
+                "The requested UUID is not a trace segment on the requested board. {unchanged}"
+            ),
+        ),
+        IpcTraceModify::LayerNotOnBoard { copper } => invalid_arg(
+            "layer",
+            &format!(
+                "the board has no copper layer '{layer}'; it has {}. {unchanged}",
+                copper.join(", ")
+            ),
+        ),
+        IpcTraceModify::UnknownNet => invalid_arg(
+            "net_name",
+            &format!("the board has no net '{net_name}'. {unchanged}"),
+        ),
+        // A live edit, not a file one: the saved board was never touched.
+        IpcTraceModify::Unproven(reason) => crate::tools::ipc_uncertain_result(&format!(
+            "KiCad committed the modify_trace update, but {reason}"
+        )),
+    })
 }
 
 /// The sibling `<project>.kicad_pro`, which is where KiCad ≥ 7 keeps net
@@ -2800,26 +2953,35 @@ async fn handle_route_diff_pair(
     let np_ipc = net_pos.clone();
     let nn_ipc = net_neg.clone();
     let layer_ipc = layer.clone();
-    ipc!(ctx, args, |c| {
-        c.add_track(
+    let routed = ipc!(ctx, args, |c, document| {
+        // Both nets must exist before either side is created.
+        if let Some(refusal) = routing_preflight(
+            c,
+            &document,
+            Some(&layer_ipc),
+            &[("net_pos", &np_ipc), ("net_neg", &nn_ipc)],
+        )? {
+            return Ok(Err(refusal));
+        }
+        c.add_tracks_in(
+            document.clone(),
             &np_ipc,
             &layer_ipc,
             width,
-            x1 + perp_x,
-            y1 + perp_y,
-            x2 + perp_x,
-            y2 + perp_y,
+            &[(x1 + perp_x, y1 + perp_y, x2 + perp_x, y2 + perp_y)],
         )?;
-        c.add_track(
+        c.add_tracks_in(
+            document,
             &nn_ipc,
             &layer_ipc,
             width,
-            x1 - perp_x,
-            y1 - perp_y,
-            x2 - perp_x,
-            y2 - perp_y,
-        )
+            &[(x1 - perp_x, y1 - perp_y, x2 - perp_x, y2 - perp_y)],
+        )?;
+        Ok(Ok(()))
     });
+    if let Err(refusal) = routed {
+        return Ok(refusal);
+    }
 
     Ok(CallToolResult::json(&json!({
         "net_pos": net_pos, "net_neg": net_neg,
@@ -5000,6 +5162,23 @@ mod route_pad_to_pad_tests {
                     "kiapi.common.commands.GetItemsResponse",
                 ));
             }
+            if command.type_url.ends_with("GetBoardEnabledLayers") {
+                let request = kiapi::board::commands::GetBoardEnabledLayers::decode(bytes).unwrap();
+                named
+                    .lock()
+                    .unwrap()
+                    .push(("GetBoardEnabledLayers", request.board));
+                return Some(copperpour_ipc::builders::pack_any(
+                    &kiapi::board::commands::BoardEnabledLayersResponse {
+                        copper_layer_count: 2,
+                        layers: vec![
+                            kiapi::board::types::BoardLayer::BlFCu as i32,
+                            kiapi::board::types::BoardLayer::BlBCu as i32,
+                        ],
+                    },
+                    "kiapi.board.commands.BoardEnabledLayersResponse",
+                ));
+            }
             if command.type_url.ends_with("GetNets") {
                 let request = kiapi::board::commands::GetNets::decode(bytes).unwrap();
                 named.lock().unwrap().push(("GetNets", request.board));
@@ -5048,7 +5227,7 @@ mod route_pad_to_pad_tests {
 
     /// R1 at (100, 60) live, R2 where the file has it. Pad positions are the
     /// file's local offsets (-0.5 / +0.5) added to each live anchor.
-    fn moved_r1() -> Vec<prost_types::Any> {
+    pub(super) fn moved_r1() -> Vec<prost_types::Any> {
         vec![
             footprint(
                 "R1",
@@ -5112,6 +5291,8 @@ mod route_pad_to_pad_tests {
         assert_eq!(
             *named.lock().unwrap(),
             [
+                ("GetBoardEnabledLayers", resolved.clone()),
+                ("GetNets", resolved.clone()),
                 ("GetItems", resolved.clone()),
                 ("GetItems", resolved.clone()),
                 ("GetNets", resolved.clone()),
@@ -5353,6 +5534,12 @@ mod apply_specctra_ses_candidate_drc_tests {
         assert!(!applied.result.is_error, "{body}");
         assert_eq!(body["drc"]["project_rules_applied"], true, "{body}");
         assert_eq!(body["drc"]["creepage_skipped"], false, "{body}");
+        // No zone on the board: nothing to refill.
+        assert_eq!(
+            body["zone_refill"],
+            json!({"required": false, "zones": [], "remedy": null}),
+            "{body}"
+        );
 
         let checked = applied.checked.expect("kicad-cli ran");
         assert_eq!(
@@ -5395,6 +5582,97 @@ mod apply_specctra_ses_candidate_drc_tests {
         assert_eq!(applied.rules.as_deref(), Some(WITH_CREEPAGE));
     }
 
+    /// The four-layer board with copper zones: the served dry run says the
+    /// import leaves their fills to be refilled, zone by layer and net, as the
+    /// manifest and the live board both count them (#430).
+    #[tokio::test]
+    async fn a_board_with_zones_is_told_to_refill_them() {
+        const ZONES: &str = include_str!("../../tests/fixtures/specctra_zones.kicad_pcb");
+        const NATIVE: &str =
+            include_str!("../../tests/fixtures/specctra_zones.native-kicad-10.dsn");
+        const ZONES_SES: &str = include_str!(
+            "../../tests/fixtures/specctra_zones.native-kicad-10.freerouting-2.3.0.ses"
+        );
+        let project = tempfile::tempdir().unwrap();
+        let board = project.path().join("board.kicad_pcb");
+        std::fs::write(&board, ZONES).unwrap();
+        let board = board.canonicalize().unwrap();
+        let mut rules = routing_rules();
+        for rule in rules.values_mut() {
+            rule.track_width_mm = Some(0.2);
+        }
+        // The native DSN without the header's courtyard, which the DSN parser
+        // does not read yet.
+        let native = NATIVE
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("(outline (polygon "))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        let export = crate::specctra::adopt_native_dsn(
+            crate::specctra::export_dsn(&board, ZONES, &rules).unwrap(),
+            native,
+        )
+        .unwrap();
+        let manifest = project.path().join("board.dsn.copperpour.json");
+        let ses = project.path().join("board.ses");
+        std::fs::write(&manifest, export.manifest).unwrap();
+        std::fs::write(&ses, ZONES_SES).unwrap();
+
+        let store = Arc::new(Mutex::new(ItemStore::default()));
+        let server = spawn_kicad_holding_items(
+            &board,
+            vec!["", "GND", "VCC"],
+            store,
+            |_| {},
+            |command, _| {
+                command.type_url.ends_with("SaveDocumentToString").then(|| {
+                    copperpour_ipc::builders::pack_any(
+                        &kiapi::common::commands::SavedDocumentResponse {
+                            contents: ZONES.to_string(),
+                            document: None,
+                        },
+                        "kiapi.common.commands.SavedDocumentResponse",
+                    )
+                })
+            },
+        );
+        let ctx = ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: server.address().to_string(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        );
+        let args = json!({"board": board, "ses_path": ses, "manifest_path": manifest});
+        let result = handle_plan_specctra_ses_import(&args, &ctx).await.unwrap();
+        let body = response_json(&result);
+        assert!(!result.is_error, "{body}");
+        assert_eq!(body["mutated"], false, "{body}");
+        assert_eq!(body["zone_refill"]["required"], true, "{body}");
+        assert_eq!(
+            body["zone_refill"]["zones"],
+            json!([
+                {"layer": "B.Cu", "net": "GND", "count": 1},
+                {"layer": "F.Cu", "net": "GND", "count": 1},
+                {"layer": "In1.Cu", "net": "GND", "count": 1},
+                {"layer": "In2.Cu", "net": "VCC", "count": 1}
+            ]),
+            "{body}"
+        );
+        assert!(
+            body["zone_refill"]["remedy"]
+                .as_str()
+                .unwrap()
+                .contains("refill_zones"),
+            "{body}"
+        );
+    }
+
     /// A non-boolean `skip_creepage` is refused before KiCad or kicad-cli is
     /// reached, and nothing is created.
     #[tokio::test]
@@ -5416,3 +5694,7 @@ mod apply_specctra_ses_candidate_drc_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "routing_preflight_tests.rs"]
+mod routing_preflight_tests;

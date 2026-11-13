@@ -7,11 +7,9 @@ members = [
     "crates/copperpour-ipc",
     "crates/copperpour-schematic-editor",
     "crates/copperpour-render",
+    "crates/copperpour-viewer",
     "crates/copperpour-vcs",
     "xtask",
-]
-exclude = [
-    "crates/schematic-viewer",  # Tauri app — built separately with `cargo tauri build`
 ]
 
 [workspace.package]
@@ -34,9 +32,13 @@ jsonschema = { version = "0.58", default-features = false }
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
+notify = "8"
+roxmltree = "0.21"
 
 # HTTP/SSE transport
 axum = { version = "0.8", features = ["macros"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
 
 # S-expression parsing
 nom = "8"
@@ -57,8 +59,8 @@ toml = "1.1"
 reqwest = { version = "0.13", features = ["json", "stream"] }
 
 # SQLite (JLCPCB database)
-rusqlite = { version = "0.40", features = ["bundled"] }
-zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 # Error handling
 anyhow = "1"
@@ -102,6 +104,7 @@ copperpour-ipc = { path = "crates/copperpour-ipc" }
 copperpour-core = { path = "crates/copperpour-core", default-features = false }
 copperpour-schematic-editor = { path = "crates/copperpour-schematic-editor" }
 copperpour-render = { path = "crates/copperpour-render" }
+copperpour-viewer = { path = "crates/copperpour-viewer" }
 copperpour-vcs = { path = "crates/copperpour-vcs" }
 
 # Full debuginfo doubles the workspace test compile (221 s vs 109 s, #291).

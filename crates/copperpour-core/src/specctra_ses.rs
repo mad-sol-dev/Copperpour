@@ -20,6 +20,10 @@ pub(crate) struct SesImportPlan {
     pub session_id: String,
     pub locked_track_count: usize,
     pub locked_via_count: usize,
+    /// Copper zones per layer and net, as the manifest and the live board
+    /// both record them. The import never touches a zone, so their fills
+    /// predate the imported routing.
+    pub zones: Vec<crate::specctra::ManifestZoneCount>,
     pub tracks: Vec<SesTrack>,
     pub arcs: Vec<SesArc>,
     pub vias: Vec<SesVia>,
@@ -72,6 +76,9 @@ struct Manifest {
     components: Vec<ManifestComponent>,
     nets: Vec<ManifestNet>,
     padstacks: Vec<ManifestPadstack>,
+    /// Required with copper zones, from schema 3 (#430).
+    #[serde(default)]
+    zones: Vec<crate::specctra::ManifestZoneCount>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -109,6 +116,17 @@ struct ManifestComponent {
     rotation_degrees: f64,
     side: String,
     pads: Vec<ManifestPin>,
+    /// Pads on no copper layer, recorded but not routed; from schema 4 (#458).
+    #[serde(default)]
+    non_copper_pads: Vec<ManifestNonCopperPad>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestNonCopperPad {
+    pad_number: String,
+    pad_uuid: String,
+    layers: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -212,6 +230,7 @@ pub(crate) fn parse_import_plan(
         session_id,
         locked_track_count: manifest.supported_profile.locked_track_count,
         locked_via_count: manifest.supported_profile.locked_via_count,
+        zones: manifest.zones,
         tracks,
         arcs,
         vias,
@@ -234,9 +253,11 @@ fn validate_manifest(board_path: &Path, board_source: &str, manifest: &Manifest)
             manifest.resolution
         );
     }
-    if manifest.supported_profile.copper_layers != 2
-        || manifest.supported_profile.component_side != "front"
-        || manifest.supported_profile.copper_zones
+    if copperpour_sexp::layers::CopperStack::new(manifest.supported_profile.copper_layers).is_err()
+        || !matches!(
+            manifest.supported_profile.component_side.as_str(),
+            "front" | "back" | "both"
+        )
         || manifest.supported_profile.custom_rules
         || manifest.supported_profile.outline.is_empty()
         || manifest.supported_profile.pad_shapes.is_empty()
@@ -250,6 +271,15 @@ fn validate_manifest(board_path: &Path, board_source: &str, manifest: &Manifest)
         || manifest.supported_profile.locked_via_count != locked_via_count
     {
         bail!("manifest locked-routing inventory does not match the live board snapshot");
+    }
+    // Schemas 1 and 2 had no zones; from 3 the inventory is the live board's.
+    if manifest.supported_profile.copper_zones == manifest.zones.is_empty()
+        || (manifest.schema_version < 3 && !manifest.zones.is_empty())
+    {
+        bail!("manifest copper-zone flag does not match its zone inventory");
+    }
+    if crate::specctra::board_zone_inventory(board_source)? != manifest.zones {
+        bail!("manifest copper-zone inventory does not match the live board snapshot");
     }
     let requested = canonical_existing(board_path)?;
     let recorded = canonical_existing(Path::new(&manifest.board_path))?;
@@ -298,7 +328,17 @@ fn validate_pins_against_board(board_source: &str, manifest: &Manifest) -> Resul
                 component.reference
             )
         })?;
-        let mut expected = live.iter().map(key).collect::<Vec<_>>();
+        // The side is an import-owned check: the SES placement is compared
+        // with the manifest, and the manifest with the board, in every mode.
+        if component.side != live.side {
+            bail!(
+                "routing manifest places {} on the {} side, the live board on the {} side",
+                component.reference,
+                component.side,
+                live.side
+            );
+        }
+        let mut expected = live.pins.iter().map(key).collect::<Vec<_>>();
         let mut recorded = component
             .pads
             .iter()
@@ -316,6 +356,24 @@ fn validate_pins_against_board(board_source: &str, manifest: &Manifest) -> Resul
         if expected != recorded {
             bail!(
                 "routing manifest pins of {} do not match its pads on the live board",
+                component.reference
+            );
+        }
+        // Pads on no copper layer are not routed, but the board they were
+        // exported from must still have them, unchanged (#458).
+        let mut recorded = component
+            .non_copper_pads
+            .iter()
+            .map(|pad| crate::specctra::NonCopperPadIdentity {
+                pad_number: pad.pad_number.clone(),
+                pad_uuid: pad.pad_uuid.clone(),
+                layers: pad.layers.clone(),
+            })
+            .collect::<Vec<_>>();
+        recorded.sort();
+        if live.non_copper_pads != recorded {
+            bail!(
+                "routing manifest pads on no copper layer of {} do not match the live board",
                 component.reference
             );
         }
@@ -355,8 +413,22 @@ fn validate_manifest_relations(manifest: &Manifest) -> Result<()> {
             bail!("manifest contains an invalid or duplicate layer mapping");
         }
     }
-    if layer_names.len() != 2 {
-        bail!("manifest must contain exactly two copper layer mappings");
+    // One mapping per copper layer, indexed top to bottom as the export
+    // writes them; a SES path on any other layer is refused when it is read.
+    let mut by_index = manifest.layers.iter().collect::<Vec<_>>();
+    by_index.sort_by_key(|layer| layer.index);
+    let stack = crate::specctra::stack_layer_names(manifest.supported_profile.copper_layers);
+    if by_index.len() != stack.len()
+        || by_index
+            .iter()
+            .zip(&stack)
+            .enumerate()
+            .any(|(index, (layer, name))| layer.index != index || &layer.kicad_name != name)
+    {
+        bail!(
+            "manifest layer mappings do not match its {} copper layers",
+            manifest.supported_profile.copper_layers
+        );
     }
 
     let net_names = manifest
@@ -384,7 +456,7 @@ fn validate_manifest_relations(manifest: &Manifest) -> Result<()> {
             || component.kiid.is_empty()
             || component.image_name.is_empty()
             || !component.rotation_degrees.is_finite()
-            || component.side != "front"
+            || !matches!(component.side.as_str(), "front" | "back")
             || !references.insert(component.reference.as_str())
         {
             bail!("manifest contains invalid component placement metadata");
@@ -423,6 +495,35 @@ fn validate_manifest_relations(manifest: &Manifest) -> Result<()> {
                 );
             }
         }
+        // A pad on no copper layer has a UUID of its own and only technical
+        // layers; schemas before 4 never recorded one (#458).
+        for pad in &component.non_copper_pads {
+            if manifest.schema_version < 4
+                || pad.pad_uuid.is_empty()
+                || !pad_uuids.insert(pad.pad_uuid.as_str())
+                || pad.layers.is_empty()
+                || pad.layers.iter().any(|layer| layer.ends_with(".Cu"))
+            {
+                bail!(
+                    "manifest contains an invalid pad on no copper layer for {}",
+                    component.reference
+                );
+            }
+        }
+    }
+    // The profile's side is the components' sides, as the export derives it.
+    let front = manifest.components.iter().any(|c| c.side == "front");
+    let back = manifest.components.iter().any(|c| c.side == "back");
+    let derived = match (front, back) {
+        (true, true) => "both",
+        (false, true) => "back",
+        _ => "front",
+    };
+    if manifest.supported_profile.component_side != derived {
+        bail!(
+            "manifest profile side '{}' does not match its components ({derived})",
+            manifest.supported_profile.component_side
+        );
     }
     for net in &manifest.nets {
         if net.class_name.is_empty() || net.pins.is_empty() {
@@ -466,7 +567,7 @@ fn validate_placement(node: &SexpNode, manifest: &Manifest) -> Result<()> {
             if x_um != component.x_um
                 || y_um != component.y_um
                 || side != component.side
-                || (rotation - component.rotation_degrees).abs() > 1e-9
+                || !same_angle(rotation, component.rotation_degrees)
             {
                 bail!("SES changes placement of component '{reference}'");
             }
@@ -481,6 +582,15 @@ fn validate_placement(node: &SexpNode, manifest: &Manifest) -> Result<()> {
         bail!("SES placement omits component(s): {}", missing.join(", "));
     }
     Ok(())
+}
+
+/// Whether two placement angles name the same direction. KiCad writes a
+/// footprint's angle in (-180, 180] and Freerouting returns it in [0, 360):
+/// KiCad's -90 comes back as 270. The tolerance is the one the comparison
+/// already had.
+fn same_angle(a: f64, b: f64) -> bool {
+    let turn = (a - b).rem_euclid(360.0);
+    turn <= 1e-9 || 360.0 - turn <= 1e-9
 }
 
 fn validate_parser(node: &SexpNode) -> Result<()> {
@@ -1022,6 +1132,86 @@ mod tests {
     /// Every manifest pin must be the live board's pad with that UUID,
     /// number and net, under the name the export gives it. A swapped, stale,
     /// missing or invented mapping is refused before anything is planned.
+    /// KiCad's stock TO-252-2 on the front and TO-263-2 on the bottom, each
+    /// with four unnumbered paste-aperture pads (#458).
+    const PASTE_PADS: &str = include_str!("../tests/fixtures/specctra_paste_pads.kicad_pcb");
+
+    fn paste_fixture() -> (tempfile::TempDir, std::path::PathBuf, serde_json::Value) {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, PASTE_PADS).unwrap();
+        let export = export_dsn(&board, PASTE_PADS, &rules()).unwrap();
+        (dir, board, serde_json::from_str(&export.manifest).unwrap())
+    }
+    fn check_paste(board: &std::path::Path, manifest: &serde_json::Value) -> String {
+        let manifest: Manifest = serde_json::from_value(manifest.clone()).unwrap();
+        match validate_manifest(board, PASTE_PADS, &manifest) {
+            Ok(()) => "ok".to_string(),
+            Err(error) => format!("{error:#}"),
+        }
+    }
+    fn u1_pads(manifest: &mut serde_json::Value) -> &mut Vec<serde_json::Value> {
+        manifest["components"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|component| component["reference"] == "U1")
+            .unwrap()["non_copper_pads"]
+            .as_array_mut()
+            .unwrap()
+    }
+
+    /// The pads on no copper layer the manifest records are the live
+    /// board's: one missing, one too many, another UUID or other layers
+    /// refuse the import (#458).
+    #[test]
+    fn manifest_pads_on_no_copper_layer_must_be_the_live_boards() {
+        let (_dir, board, manifest) = paste_fixture();
+        assert_eq!(check_paste(&board, &manifest), "ok");
+        let mismatch = "routing manifest pads on no copper layer of U1 do not match the live board";
+
+        let mut missing = manifest.clone();
+        u1_pads(&mut missing).pop();
+        assert_eq!(check_paste(&board, &missing), mismatch);
+
+        let mut stale = manifest.clone();
+        u1_pads(&mut stale)[0]["pad_uuid"] = "00000000-0000-4000-8000-000000000000".into();
+        assert_eq!(check_paste(&board, &stale), mismatch);
+
+        let mut moved = manifest.clone();
+        u1_pads(&mut moved)[0]["layers"] = serde_json::json!(["F.Mask"]);
+        assert_eq!(check_paste(&board, &moved), mismatch);
+
+        let mut renumbered = manifest.clone();
+        u1_pads(&mut renumbered)[0]["pad_number"] = "25".into();
+        assert_eq!(check_paste(&board, &renumbered), mismatch);
+    }
+
+    /// A recorded pad on no copper layer must have its own UUID and only
+    /// technical layers, and only a schema 4 manifest records one (#458).
+    #[test]
+    fn manifest_pads_on_no_copper_layer_are_validated() {
+        let (_dir, board, manifest) = paste_fixture();
+        let invalid = "manifest contains an invalid pad on no copper layer for U1";
+
+        let mut copper = manifest.clone();
+        u1_pads(&mut copper)[0]["layers"] = serde_json::json!(["F.Cu", "F.Paste"]);
+        assert_eq!(check_paste(&board, &copper), invalid);
+
+        let mut no_layers = manifest.clone();
+        u1_pads(&mut no_layers)[0]["layers"] = serde_json::json!([]);
+        assert_eq!(check_paste(&board, &no_layers), invalid);
+
+        let mut repeated = manifest.clone();
+        let uuid = u1_pads(&mut repeated)[0]["pad_uuid"].clone();
+        u1_pads(&mut repeated)[1]["pad_uuid"] = uuid;
+        assert_eq!(check_paste(&board, &repeated), invalid);
+
+        let mut schema_3 = manifest.clone();
+        schema_3["schema_version"] = 3.into();
+        assert_eq!(check_paste(&board, &schema_3), invalid);
+    }
+
     #[test]
     fn manifest_pins_must_be_the_live_boards_pads() {
         let (_dir, board, manifest) = duplicate_fixture();
@@ -1098,9 +1288,9 @@ mod tests {
             }
         }
         assert_eq!(check(&board, &schema_1), invalid);
-        let mut schema_3 = manifest.clone();
-        schema_3["schema_version"] = 3.into();
-        assert!(check(&board, &schema_3).contains("unsupported Specctra manifest schema 3"));
+        let mut schema_5 = manifest.clone();
+        schema_5["schema_version"] = 5.into();
+        assert!(check(&board, &schema_5).contains("unsupported Specctra manifest schema 5"));
     }
 
     #[test]
@@ -1173,6 +1363,136 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("revision"), "{error}");
+    }
+
+    /// KiCad 10.0.8's board with footprints at -90, 0, -45 and 180 degrees
+    /// (`specctra_negative_rotation.generate.py`), and Freerouting 2.3.0's
+    /// session for its Rust export, which writes the angles in [0, 360).
+    const NEGATIVE_ROTATION: &str =
+        include_str!("../tests/fixtures/specctra_negative_rotation.kicad_pcb");
+    const NEGATIVE_ROTATION_SES: &str =
+        include_str!("../tests/fixtures/specctra_negative_rotation.freerouting-2.3.0.ses");
+
+    fn negative_rotation_fixture() -> (tempfile::TempDir, std::path::PathBuf, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, NEGATIVE_ROTATION).unwrap();
+        let export = export_dsn(&board, NEGATIVE_ROTATION, &rules()).unwrap();
+        (dir, board, export.manifest)
+    }
+
+    #[test]
+    fn freerouting_session_of_negative_angles_imports() {
+        let (_dir, board, manifest) = negative_rotation_fixture();
+        let rotations = serde_json::from_str::<serde_json::Value>(&manifest).unwrap()["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|component| {
+                (
+                    component["reference"].as_str().unwrap().to_string(),
+                    component["rotation_degrees"].as_f64().unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let expected = [("R1", -90.0), ("R2", 0.0), ("R3", -45.0), ("R4", 180.0)]
+            .into_iter()
+            .map(|(reference, degrees)| (reference.to_string(), degrees))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(rotations, expected);
+        for place in [
+            "(place R1 1000000 -500000 front 270)",
+            "(place R3 1000000 -400000 front 315)",
+            "(place R4 1100000 -400000 front 180)",
+        ] {
+            assert!(NEGATIVE_ROTATION_SES.contains(place), "{place}");
+        }
+        let plan =
+            parse_import_plan(&board, NEGATIVE_ROTATION, &manifest, NEGATIVE_ROTATION_SES).unwrap();
+        assert!(!plan.tracks.is_empty());
+    }
+
+    #[test]
+    fn session_angle_written_as_kicad_does_still_imports() {
+        let (_dir, board, manifest) = negative_rotation_fixture();
+        let ses = NEGATIVE_ROTATION_SES
+            .replace(
+                "(place R1 1000000 -500000 front 270)",
+                "(place R1 1000000 -500000 front -90)",
+            )
+            .replace(
+                "(place R4 1100000 -400000 front 180)",
+                "(place R4 1100000 -400000 front -180)",
+            );
+        parse_import_plan(&board, NEGATIVE_ROTATION, &manifest, &ses).unwrap();
+    }
+
+    #[test]
+    fn real_rotation_in_session_is_refused() {
+        let (_dir, board, manifest) = negative_rotation_fixture();
+        for (from, to, reference) in [
+            (
+                "(place R1 1000000 -500000 front 270)",
+                "(place R1 1000000 -500000 front 180)",
+                "R1",
+            ),
+            (
+                "(place R1 1000000 -500000 front 270)",
+                "(place R1 1000000 -500000 front 90)",
+                "R1",
+            ),
+            (
+                "(place R2 1100000 -500000 front 0)",
+                "(place R2 1100000 -500000 front 90)",
+                "R2",
+            ),
+            (
+                "(place R3 1000000 -400000 front 315)",
+                "(place R3 1000000 -400000 front 45)",
+                "R3",
+            ),
+            (
+                "(place R4 1100000 -400000 front 180)",
+                "(place R4 1100000 -400000 front 0)",
+                "R4",
+            ),
+        ] {
+            assert!(NEGATIVE_ROTATION_SES.contains(from), "{from}");
+            let ses = NEGATIVE_ROTATION_SES.replace(from, to);
+            let error = parse_import_plan(&board, NEGATIVE_ROTATION, &manifest, &ses)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                error,
+                format!("SES changes placement of component '{reference}'"),
+                "{to}"
+            );
+        }
+    }
+
+    #[test]
+    fn same_angle_compares_modulo_a_full_turn() {
+        for (a, b) in [
+            (-90.0, 270.0),
+            (270.0, -90.0),
+            (-45.0, 315.0),
+            (180.0, -180.0),
+            (0.0, 360.0),
+            (0.0, -720.0),
+            (-90.0, 269.999_999_999_9),
+            (-90.0, 270.000_000_000_1),
+        ] {
+            assert!(same_angle(a, b), "{a} {b}");
+        }
+        for (a, b) in [
+            (90.0, 180.0),
+            (-90.0, 90.0),
+            (0.0, 1e-6),
+            (0.0, 359.999_999),
+            (-45.0, 45.0),
+        ] {
+            assert!(!same_angle(a, b), "{a} {b}");
+        }
     }
 
     #[test]

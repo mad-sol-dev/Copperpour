@@ -276,9 +276,13 @@ impl McpHandler {
             Err(e) => Some(JsonRpcResponse::error(
                 id,
                 JsonRpcError {
-                    code: INTERNAL_ERROR,
+                    code: e
+                        .downcast_ref::<crate::guidance::ResourceRequestError>()
+                        .map_or(INTERNAL_ERROR, |error| error.code),
                     message: e.to_string(),
-                    data: None,
+                    data: e
+                        .downcast_ref::<crate::guidance::ResourceRequestError>()
+                        .and_then(|error| error.data.clone()),
                 },
             )),
         }
@@ -352,8 +356,15 @@ impl McpHandler {
                 Ok(Some(serde_json::to_value(call_result)?))
             }
 
+            // Static embedded guidance only; resource reads never touch the filesystem.
+            "resources/list" => Ok(Some(crate::guidance::list_resources(req.params.as_ref())?)),
+            "resources/read" => Ok(Some(crate::guidance::read_resource(req.params.as_ref())?)),
+            "resources/templates/list" => {
+                crate::guidance::validate_list_params(req.params.as_ref())?;
+                Ok(Some(json!({"resourceTemplates": []})))
+            }
+
             // ── Unimplemented MCP methods ──────────────────────────────────
-            "resources/list" | "resources/read" => Ok(Some(json!({ "resources": [] }))),
             "prompts/list" => Ok(Some(json!({ "prompts": [] }))),
 
             method => {
@@ -576,14 +587,15 @@ impl McpHandler {
                         Some("mutation_outcome_uncertain".to_string()),
                     )
                 }
-                Err(e) if kicad_editor_locked_path(&e).is_some() => {
-                    let locked = kicad_editor_locked_path(&e).expect("guard matched");
+                Err(e) if kicad_editor_lock(&e).is_some() => {
+                    let lock = kicad_editor_lock(&e).expect("guard matched");
+                    let locked = lock.path;
                     let path = locked.display().to_string();
                     if locked
                         .extension()
                         .is_some_and(|extension| extension.eq_ignore_ascii_case("kicad_pcb"))
                     {
-                        let reason = kicad_board_lock_reason(&e).to_string();
+                        let reason = board_lock_reason(&lock).to_string();
                         (
                             CallToolResult::error_kind(
                                 ToolErrorKind::UnsafeFileFallback {
@@ -611,6 +623,17 @@ impl McpHandler {
                             Some("conflict".to_string()),
                         )
                     }
+                }
+                // The file changed after the tool read it, and the writer
+                // refused before replacing it: a refusal, as a structured
+                // `conflict` from the tool would be.
+                Err(e) if crate::tools::revision_conflict_path(&e).is_some() => {
+                    let path = crate::tools::revision_conflict_path(&e).expect("guard matched");
+                    (
+                        crate::tools::revision_conflict_result(path, name),
+                        CallStatus::Error,
+                        Some("conflict".to_string()),
+                    )
                 }
                 Err(e) => {
                     warn!(tool = %name, error = %e, "tool handler returned anyhow::Error");
@@ -706,36 +729,18 @@ async fn with_request_progress<F: std::future::Future>(
     REQUEST_PROGRESS.scope(progress, future).await
 }
 
-fn kicad_editor_locked_path(error: &anyhow::Error) -> Option<&std::path::Path> {
-    for cause in error.chain() {
-        if let Some(copperpour_sexp::SexpError::KiCadEditorLocked { path, .. }) =
-            cause.downcast_ref::<copperpour_sexp::SexpError>()
-        {
-            return Some(path);
-        }
-        if let Some(copperpour_schematic_editor::Error::KiCadEditorLocked { path, .. }) =
-            cause.downcast_ref::<copperpour_schematic_editor::Error>()
-        {
-            return Some(path);
-        }
+/// The `unsafe_file_fallback` reason for a board write KiCad's lock refused.
+fn board_lock_reason(lock: &crate::tools::LockedDocument<'_>) -> &'static str {
+    if lock.inspection_error.is_some() {
+        "kicad_lock_unreadable"
+    } else {
+        "kicad_lock_present"
     }
-    None
 }
 
-fn kicad_board_lock_reason(error: &anyhow::Error) -> &'static str {
-    for cause in error.chain() {
-        if let Some(copperpour_sexp::SexpError::KiCadEditorLocked {
-            inspection_error, ..
-        }) = cause.downcast_ref::<copperpour_sexp::SexpError>()
-        {
-            return if inspection_error.is_some() {
-                "kicad_lock_unreadable"
-            } else {
-                "kicad_lock_present"
-            };
-        }
-    }
-    "kicad_lock_present"
+/// The KiCad editor lock anywhere in `error`'s chain.
+fn kicad_editor_lock(error: &anyhow::Error) -> Option<crate::tools::LockedDocument<'_>> {
+    error.chain().find_map(crate::tools::kicad_editor_lock)
 }
 
 /// Sum of content bytes in a `CallToolResult` — used for observability size
@@ -874,6 +879,23 @@ mod required_argument_dispatch_tests {
     use super::*;
     use crate::tools::ServerConfig;
 
+    /// A board lock that could not be inspected is reported as unreadable,
+    /// wherever in the error's chain the lock error sits.
+    #[test]
+    fn an_unreadable_board_lock_keeps_its_reason() {
+        let reason = |inspection_error: Option<&str>| {
+            let error = anyhow::Error::new(copperpour_sexp::SexpError::KiCadEditorLocked {
+                path: "a.kicad_pcb".into(),
+                lock_path: "~a.kicad_pcb.lck".into(),
+                inspection_error: inspection_error.map(str::to_owned),
+            })
+            .context("writing the board");
+            board_lock_reason(&kicad_editor_lock(&error).unwrap())
+        };
+        assert_eq!(reason(None), "kicad_lock_present");
+        assert_eq!(reason(Some("permission denied")), "kicad_lock_unreadable");
+    }
+
     async fn handler() -> McpHandler {
         McpHandler::new(ServerConfig {
             kicad_cli: String::new(),
@@ -955,6 +977,11 @@ mod required_argument_dispatch_tests {
                 "positions",
             ),
             ("batch_rotate_labels", json!({ "schematic": s }), "labels"),
+            (
+                "batch_add_schematic_net_label",
+                json!({ "schematic": s }),
+                "labels",
+            ),
             (
                 "bulk_move_schematic_components",
                 json!({ "schematic": s, "dx": 1.0, "dy": 1.0 }),
@@ -3095,24 +3122,29 @@ mod client_adaptation_tests {
             .expect("initialize returns a result")
     }
 
-    /// Drift reaches the model through `instructions` (#728); with nothing
-    /// to report, or no probe at all, the field is absent rather than empty.
+    /// Rules reach every session, independently of the optional drift notice.
     #[tokio::test]
     async fn initialize_carries_a_guidance_notice_only_when_there_is_one() {
         let bare = lazy_handler().await;
-        assert!(initialize_result(&bare).await.get("instructions").is_none());
+        assert_eq!(
+            initialize_result(&bare).await["instructions"],
+            crate::guidance::SESSION_RULES
+        );
 
         let quiet = lazy_handler().await;
         quiet.set_guidance_probe(Arc::new(FixedProbe(None)));
-        assert!(initialize_result(&quiet)
-            .await
-            .get("instructions")
-            .is_none());
+        assert_eq!(
+            initialize_result(&quiet).await["instructions"],
+            crate::guidance::SESSION_RULES
+        );
 
         let drifted = lazy_handler().await;
         drifted.set_guidance_probe(Arc::new(FixedProbe(Some("run copperpour init"))));
         let result = initialize_result(&drifted).await;
-        assert_eq!(result["instructions"], "run copperpour init");
+        assert_eq!(
+            result["instructions"],
+            format!("{}\n\nrun copperpour init", crate::guidance::SESSION_RULES)
+        );
         assert_eq!(result["serverInfo"]["name"], "copperpour");
     }
 

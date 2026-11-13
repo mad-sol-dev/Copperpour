@@ -300,12 +300,16 @@ pub fn tools() -> Vec<ToolDef> {
              an enabled authenticated ActionPlugin bridge supplies KiCad's native DSN while the \
              IPC snapshot and reverse manifest remain authoritative; otherwise the Rust exporter \
              is used. The first \
-             supported profile is deliberately narrow: two copper layers, front-side SMD or \
-             through-hole footprints, circle, rectangle, unchamfered rounded-rectangle and oval \
+             supported profile is deliberately narrow: an even number of copper layers (F.Cu, \
+             In1.Cu..In<N-2>.Cu, B.Cu; 2 to 32), SMD or through-hole footprints on either side \
+             (a bottom footprint written as KiCad writes it: its front image placed on the back), \
+             through-hole pads and vias on every copper layer, circle, rectangle, unchamfered rounded-rectangle and oval \
              pads with one shape on every copper layer (rounded rectangles written as polygons \
              that enclose the copper, ovals as paths as KiCad writes them), round drills, \
-             one straight-line closed outline, \
-             and no existing tracks, vias, or zones. Copperpour refuses unsupported geometry or \
+             one closed outline made from straight lines and circular arcs (arcs flattened within the board's max_error), \
+             no existing tracks or vias, and copper zones with a net and a straight-edged outline \
+             without cutouts, each written as a plane on every copper layer it covers (its fill is \
+             not exported; rule areas are refused). Copperpour refuses unsupported geometry or \
              custom DRC rules, or incomplete effective routing rules instead of approximating \
              them, and writes a \
              revision-bound reverse manifest beside the DSN for later SES import.",
@@ -459,6 +463,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "output": { "type": "string", "description": "Optional path to write DRC report JSON" },
                     "sync_live_board": { "type": "boolean", "default": false, "description": "Bind the requested open board, optionally refill, save and verify its persisted snapshot before CLI DRC. Finish other mutations first." },
                     "refill_zones": { "type": "boolean", "default": false, "description": "Refill before checking: persisted IPC fill with sync_live_board, analysis-only CLI fill otherwise." },
+                    "limit": { "type": "integer", "minimum": 0, "default": 50, "description": "Maximum violations to display (0 for counts only). Full DRC and output report are unaffected; shown/truncated describe the displayed list." },
                     "severity": {
                         "type": "string",
                         "description": "Minimum severity to include: 'error', 'warning' (default), 'info'",
@@ -935,7 +940,10 @@ async fn handle_export_specctra_dsn(
                 "ses_import_available": false,
                 "freerouting_bridge_available": false,
                 "source_revision_bound": true,
-                "supported_profile": "two_layer_front_side_circle_rect_roundrect_oval_no_existing_routing_or_zones"
+                "supported_profile": "even_layer_both_sides_circle_rect_roundrect_oval_no_existing_routing_zones_as_planes",
+                "copper_layers": export.copper_layer_count,
+                "copper_zones": export.copper_zone_count,
+                "component_side": export.component_side
             }
         })
         .to_string(),
@@ -1109,6 +1117,10 @@ async fn handle_get_drc_violations(
     let board = get_path(args, "board")?;
     let severity_filter = args["severity"].as_str().unwrap_or("warning");
     let min_rank = severity_rank(severity_filter);
+    let limit = match super::response_limit(args, 50) {
+        Ok(limit) => limit,
+        Err(error) => return Ok(error),
+    };
 
     let (report, provenance) = match super::drc::run(ctx, &board, args).await? {
         Ok(result) => result,
@@ -1133,6 +1145,7 @@ async fn handle_get_drc_violations(
         .filter(|v| severity_rank(&v.severity) >= min_rank)
         .collect();
 
+    let bounded = super::BoundedList::new(&filtered, limit);
     let summary = json!({
         "total": report.all().count(),
         "source": provenance.source,
@@ -1146,7 +1159,9 @@ async fn handle_get_drc_violations(
         "schematic_parity_diagnostic": report.schematic_parity_diagnostic,
         "filtered_count": filtered.len(),
         "severity_filter": severity_filter,
-        "violations": filtered.iter().map(|v| json!({
+        "shown": bounded.shown,
+        "truncated": bounded.truncated,
+        "violations": bounded.items.iter().map(|v| json!({
             "severity": v.severity,
             "rule": v.rule,
             "description": v.description,
@@ -1729,23 +1744,24 @@ mod specctra_roundrect_served_tests {
         }
     }
 
-    #[tokio::test]
-    async fn served_export_writes_stock_roundrect_pads_as_polygons() {
+    /// `export_specctra_dsn` served over a mock KiCad holding `source`, every
+    /// net in KiCad's default netclass: the temporary directory, the response
+    /// body, and the DSN written.
+    async fn served_export(
+        file_name: &str,
+        source: &'static str,
+        nets: &'static [&'static str],
+    ) -> (tempfile::TempDir, Value, String) {
         let dir = tempfile::tempdir().unwrap();
-        let board = dir
-            .path()
-            .canonicalize()
-            .unwrap()
-            .join("specctra_stock_roundrect.kicad_pcb");
-        std::fs::write(&board, STOCK_ROUNDRECT).unwrap();
+        let board = dir.path().canonicalize().unwrap().join(file_name);
+        std::fs::write(&board, source).unwrap();
         let output = dir.path().join("board.dsn");
-        let nets = ["GND", "SIG", "VCC"];
         let server = spawn_kicad_holding_board(&board, move |command| {
             let name = command.type_url.rsplit('.').next().unwrap();
             Some(match name {
                 "SaveDocumentToString" => pack_any(
                     &kiapi::common::commands::SavedDocumentResponse {
-                        contents: STOCK_ROUNDRECT.to_string(),
+                        contents: source.to_string(),
                         document: None,
                     },
                     "kiapi.common.commands.SavedDocumentResponse",
@@ -1753,7 +1769,7 @@ mod specctra_roundrect_served_tests {
                 "GetNets" => pack_any(
                     &kiapi::board::commands::NetsResponse {
                         nets: (1..)
-                            .zip(nets)
+                            .zip(nets.iter().copied())
                             .map(|(code, net)| copperpour_ipc::builders::net(net, code))
                             .collect(),
                     },
@@ -1795,13 +1811,27 @@ mod specctra_roundrect_served_tests {
         let text = result["content"][0]["text"].as_str().unwrap();
         assert_eq!(result["isError"], false, "{text}");
         let body: Value = serde_json::from_str(text).unwrap();
+        let dsn = std::fs::read_to_string(&output).unwrap();
+        (dir, body, dsn)
+    }
+
+    #[tokio::test]
+    async fn served_export_writes_stock_roundrect_pads_as_polygons() {
+        let (dir, body, dsn) = served_export(
+            "specctra_stock_roundrect.kicad_pcb",
+            STOCK_ROUNDRECT,
+            &["GND", "SIG", "VCC"],
+        )
+        .await;
         assert_eq!(body["method"], "kicad_ipc_snapshot");
         assert_eq!(body["pad_count"], 6);
         assert_eq!(
             body["capabilities"]["supported_profile"],
-            "two_layer_front_side_circle_rect_roundrect_oval_no_existing_routing_or_zones"
+            "even_layer_both_sides_circle_rect_roundrect_oval_no_existing_routing_zones_as_planes"
         );
-        let dsn = std::fs::read_to_string(&output).unwrap();
+        assert_eq!(body["capabilities"]["copper_layers"], 2);
+        assert_eq!(body["capabilities"]["component_side"], "front");
+        assert_eq!(body["capabilities"]["copper_zones"], 0);
         assert_eq!(dsn.matches("(polygon F.Cu 0").count(), 3, "{dsn}");
         let manifest: Value = serde_json::from_str(
             &std::fs::read_to_string(dir.path().join("board.dsn.copperpour.json")).unwrap(),
@@ -1815,6 +1845,50 @@ mod specctra_roundrect_served_tests {
             .map(|padstack| padstack["corner_radius_um"].as_i64().unwrap())
             .collect::<Vec<_>>();
         assert_eq!(radii, [135, 200, 225]);
+    }
+
+    /// The response's copper layer count is the board's (#430).
+    #[tokio::test]
+    async fn served_export_reports_the_boards_copper_layers() {
+        let (_dir, body, dsn) = served_export(
+            "specctra_four_layers.kicad_pcb",
+            include_str!("../../tests/fixtures/specctra_four_layers.kicad_pcb"),
+            &["GND", "VCC"],
+        )
+        .await;
+        assert_eq!(body["capabilities"]["copper_layers"], 4);
+        assert_eq!(body["pad_count"], 6);
+        assert!(dsn.contains("(layer In2.Cu"), "{dsn}");
+    }
+
+    /// The response's zone count is the board's, each zone a plane per
+    /// copper layer it covers (#430).
+    #[tokio::test]
+    async fn served_export_reports_the_boards_copper_zones() {
+        let (_dir, body, dsn) = served_export(
+            "specctra_zones.kicad_pcb",
+            include_str!("../../tests/fixtures/specctra_zones.kicad_pcb"),
+            &["GND", "VCC"],
+        )
+        .await;
+        assert_eq!(body["capabilities"]["copper_zones"], 3, "{body}");
+        assert_eq!(dsn.matches("(plane GND\n").count(), 3, "{dsn}");
+        assert_eq!(dsn.matches("(plane VCC\n").count(), 1, "{dsn}");
+        assert!(dsn.contains("(polygon In2.Cu 0 81000 -31000"), "{dsn}");
+    }
+
+    /// The response says which sides the footprints are on, and a bottom
+    /// footprint is placed `back` (#430).
+    #[tokio::test]
+    async fn served_export_reports_bottom_side_footprints() {
+        let (_dir, body, dsn) = served_export(
+            "specctra_bottom_side.kicad_pcb",
+            include_str!("../../tests/fixtures/specctra_bottom_side.kicad_pcb"),
+            &["GND", "VCC"],
+        )
+        .await;
+        assert_eq!(body["capabilities"]["component_side"], "both", "{body}");
+        assert!(dsn.contains("(place U1 112000 -56000 back 330)"), "{dsn}");
     }
 }
 
@@ -2007,7 +2081,7 @@ mod specctra_rotation_served_tests {
             &std::fs::read_to_string(body["manifest_output_path"].as_str().unwrap()).unwrap(),
         )
         .unwrap();
-        assert_eq!(manifest["schema_version"], 2);
+        assert_eq!(manifest["schema_version"], 4);
         let j1 = manifest["components"]
             .as_array()
             .unwrap()

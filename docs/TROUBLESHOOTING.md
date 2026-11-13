@@ -1,5 +1,31 @@
 # Troubleshooting
 
+## Schematic viewer without a desktop session
+
+`open_schematic_viewer` uses the loopback browser service. It can serve saved schematics
+when the MCP client's server environment has no `DISPLAY`, `WAYLAND_DISPLAY`,
+or `XDG_RUNTIME_DIR`. Set `open_browser: false` for headless or remote use:
+
+```json
+{"schematic": "/absolute/project/root.kicad_sch", "open_browser": false}
+```
+
+Open the returned private `url` in a browser yourself. A default OS-opener failure
+is reported separately in `browser_launch_error`; it does not stop a successfully
+started service or remove the returned URL. The viewer displays saved files,
+so save the schematic before expecting edits to appear. For remote use, forward
+the returned loopback port to the same local port, preserving `127.0.0.1`
+and the URL's private credential fragment;
+see [viewer service contract](../crates/copperpour-viewer/README.md#service-contract).
+
+If `open_schematic_viewer` still reports `Failed to initialize GTK`, check
+`get_installation_info`: restart the MCP client with a build containing the
+browser-backed tool (introduced in #439).
+Older installed binaries keep their previous behavior.
+
+The standalone `schematic-viewer` command has been retired. Use the MCP tool
+instead; there is no separate viewer executable to install or configure.
+
 ## JLCPCB assembly cannot obtain native midpoint geometry
 
 Open the exact requested `.kicad_pcb` in PCB Editor and enable KiCad IPC.
@@ -199,6 +225,11 @@ That message means the transport was unreachable. If KiCAD *is* running with
 that board open and a tool still refuses, the error you get back is the tool's
 own reason — "a polygon needs at least 3 points", "requested board … is not open
 in KiCAD" — and it names what to change about the request.
+
+`place_component`, `move_component`, `rotate_component`, and (on KiCad 10.0.6+)
+`flip_component` can fall back to a closed board file when no KiCad process is
+reachable. An older, reachable KiCad makes `flip_component` refuse rather than
+silently edit the file underneath it.
 
 ## KiCad is running, but `ipc_failure` says it did not answer
 
@@ -603,7 +634,7 @@ restart the Muse session: Muse does not respawn a running MCP server, so the
 setting takes effect on the next session start. Cost is the usual ~25K tokens
 per listing instead of ~2K.
 
-## Plugin doesn't appear in KiCAD
+## Plugin doesn't appear in KiCad
 
 Install via **Plugin and Content Manager → Install from File** with the
 `copperpour-pcm-*.zip` release asset (not the bare binary archives), then restart

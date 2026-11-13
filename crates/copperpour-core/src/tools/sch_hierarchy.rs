@@ -354,8 +354,18 @@ pub(crate) async fn handle_create_schematic(
     // Write the template then immediately load/save through cse so the file
     // is normalised to cse's writer output format.
     write_new_atomic(&path, &template)?;
-    let sch = cse::Schematic::load(&path)?;
-    sch.overwrite()?;
+    // The file exists now, so a failure from here on is not a refusal.
+    if let Err(error) = cse::Schematic::load(&path).and_then(|sch| sch.overwrite()) {
+        let error = anyhow::Error::from(error);
+        if crate::tools::readback_mismatch_path(&error).is_some() {
+            return Err(error);
+        }
+        return Ok(crate::tools::mutation_outcome_uncertain(
+            &path,
+            "create_schematic",
+            format!("the created schematic could not be rewritten: {error}"),
+        ));
+    }
     Ok(CallToolResult::json(&json!({
         "created": path.display().to_string(),
         "size": size,
@@ -713,7 +723,9 @@ async fn handle_set_schematic_title_block(
 // ─── Shared helpers ─────────────────────────────────────────────────────────
 
 pub(crate) const MAX_HIERARCHY_DEPTH: usize = 20;
-const ALLOWED_PIN_TYPES: &[&str] = &["input", "output", "bidirectional", "tri_state", "passive"];
+/// A sheet pin's shapes, and the hierarchical and global label's.
+pub(crate) const ALLOWED_PIN_TYPES: &[&str] =
+    &["input", "output", "bidirectional", "tri_state", "passive"];
 const SHEET_PIN_SPACING_MM: f64 = 2.54;
 
 /// Slack for turning a coordinate into a slot index.

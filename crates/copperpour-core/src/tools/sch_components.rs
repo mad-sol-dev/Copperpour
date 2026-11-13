@@ -39,6 +39,29 @@ use copperpour_sexp::{
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 
+pub(crate) fn field_placements_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "description": "Move or hide a field's text, keyed by field name (Reference, Value, Footprint, or a custom property). Each entry may set x, y, rotation and hide; an omitted part is left as the file has it. Coordinates are absolute schematic millimetres, as KiCad stores them — not offsets from the body.",
+        "additionalProperties": {
+            "type": "object",
+            "properties": {
+                "x": { "type": "number" },
+                "y": { "type": "number" },
+                "rotation": { "type": "number" },
+                "hide": { "type": "boolean", "description": "true hides the field's text on the sheet; false shows it." }
+            }
+        }
+    })
+}
+
+pub(crate) fn field_placement_unit_schema() -> serde_json::Value {
+    json!({
+        "type": "integer",
+        "description": "Which placed unit field_placements applies to. Required when x or y is given and the component has more than one placed unit, because a field position is absolute and one coordinate cannot be right for several placements."
+    })
+}
+
 pub fn tools() -> Vec<ToolDef> {
     vec![
         tool!(
@@ -116,23 +139,8 @@ pub fn tools() -> Vec<ToolDef> {
                         "items": { "type": "string" },
                         "description": "Custom property names to delete from every placed unit. KiCad's mandatory fields (Reference, Value, Footprint, Datasheet, Description) cannot be removed. A name no unit carries is reported in absent_fields."
                     },
-                    "field_placements": {
-                        "type": "object",
-                        "description": "Move or hide a field's text, keyed by field name (Reference, Value, Footprint, or a custom property). Each entry may set x, y, rotation and hide; an omitted part is left as the file has it. Coordinates are absolute schematic millimetres, as KiCad stores them — not offsets from the body.",
-                        "additionalProperties": {
-                            "type": "object",
-                            "properties": {
-                                "x": { "type": "number" },
-                                "y": { "type": "number" },
-                                "rotation": { "type": "number" },
-                                "hide": { "type": "boolean", "description": "true hides the field's text on the sheet; false shows it." }
-                            }
-                        }
-                    },
-                    "unit": {
-                        "type": "integer",
-                        "description": "Which placed unit field_placements applies to. Required when x or y is given and the component has more than one placed unit, because a field position is absolute and one coordinate cannot be right for several placements."
-                    }
+                    "field_placements": field_placements_schema(),
+                    "unit": field_placement_unit_schema()
                 },
                 "required": ["schematic", "reference"]
             }),
@@ -612,6 +620,15 @@ pub(crate) async fn handle_add_schematic_component(
         unit,
     );
     if let Err(error) = sch.overwrite() {
+        if let Some(refusal) =
+            crate::tools::unwritten_schematic_refusal("add_schematic_component", &error)
+        {
+            return Ok(crate::outcome::refused_before_write(
+                refusal,
+                sch_path.display().to_string(),
+                1,
+            ));
+        }
         let uncertain = crate::tools::mutation_outcome_uncertain(
             &sch_path,
             "add_schematic_component",
@@ -1771,7 +1788,7 @@ fn load_component_mutation_readback(
 }
 
 #[derive(Debug, Clone)]
-struct ComponentMutationIntent {
+pub(crate) struct ComponentMutationIntent {
     target: ComponentTarget,
     field_placements: Vec<(String, FieldPlacement)>,
     placement_unit: Option<u32>,
@@ -1784,6 +1801,31 @@ impl ComponentMutationIntent {
             field_placements: Vec::new(),
             placement_unit: None,
         }
+    }
+
+    /// Later batch entries may update values/DNP on the same component. Hold
+    /// those to their final successful assignments while retaining placement
+    /// identity and geometry bound before the field-text edit.
+    pub(crate) fn with_batch_updates(
+        mut self,
+        fields: &BTreeMap<String, String>,
+        dnp: Option<bool>,
+    ) -> Self {
+        self.target = self.target.with_fields(fields).with_dnp(dnp);
+        self
+    }
+
+    pub(crate) fn placement_keys(&self) -> Vec<(String, String)> {
+        self.target
+            .units
+            .iter()
+            .filter(|unit| self.placement_unit.is_none_or(|wanted| unit.unit == wanted))
+            .flat_map(|unit| {
+                self.field_placements
+                    .iter()
+                    .map(move |(name, _)| (unit.uuid.clone(), name.clone()))
+            })
+            .collect()
     }
 
     fn with_field_placements(
@@ -1826,7 +1868,7 @@ fn verify_requested_field_placements(
     Ok(())
 }
 
-fn verify_component_mutation_intents(
+pub(crate) fn verify_component_mutation_intents(
     path: &std::path::Path,
     schematic: &cse::Schematic,
     intents: &[ComponentMutationIntent],
@@ -3046,6 +3088,184 @@ fn plan_property_removal(
     Ok((edits, units))
 }
 
+#[derive(Default)]
+struct FieldPlacementEdits {
+    changes: Vec<String>,
+    errors: Vec<String>,
+    applied: Vec<(String, FieldPlacement)>,
+    unit: Option<u32>,
+}
+
+pub(crate) struct FieldPlacementFailure {
+    pub(crate) error: CallToolResult,
+    pub(crate) abort_batch: bool,
+}
+
+impl FieldPlacementFailure {
+    fn local(error: CallToolResult) -> Self {
+        Self {
+            error,
+            abort_batch: false,
+        }
+    }
+}
+
+fn apply_field_placements(
+    content: &mut String,
+    reference: &str,
+    args: &serde_json::Value,
+    unit_count: usize,
+) -> Result<FieldPlacementEdits, FieldPlacementFailure> {
+    let placements = args["field_placements"].as_object();
+    let mut plan = FieldPlacementEdits::default();
+    if let Some(placements) = placements {
+        let only_unit = field_placement_unit(args).map_err(FieldPlacementFailure::local)?;
+        for (name, spec) in placements {
+            let Some(spec) = spec.as_object() else {
+                plan.errors
+                    .push(format!("{name}: field_placements entries must be objects"));
+                continue;
+            };
+            let mut placement = FieldPlacement::default();
+            let mut bad = false;
+            for (key, slot) in [
+                ("x", &mut placement.x),
+                ("y", &mut placement.y),
+                ("rotation", &mut placement.rotation),
+            ] {
+                match spec.get(key) {
+                    None | Some(serde_json::Value::Null) => {}
+                    Some(value) => match value.as_f64() {
+                        Some(number) => *slot = Some(number),
+                        None => {
+                            plan.errors.push(format!("{name}.{key}: expected a number"));
+                            bad = true;
+                        }
+                    },
+                }
+            }
+            match spec.get("hide") {
+                None | Some(serde_json::Value::Null) => {}
+                Some(value) => match value.as_bool() {
+                    Some(hide) => placement.hide = Some(hide),
+                    None => {
+                        plan.errors
+                            .push(format!("{name}.hide: expected true or false"));
+                        bad = true;
+                    }
+                },
+            }
+            if bad {
+                continue;
+            }
+            if placement.is_empty() {
+                plan.errors.push(format!(
+                    "{name}: field_placements entry sets nothing — give x, y, rotation or hide"
+                ));
+                continue;
+            }
+            // A field's position is absolute, so one coordinate cannot be
+            // right for several placements. Writing it to every unit would
+            // stack the text of a quad gate's four Values on one point and
+            // report success.
+            if placement.moves_the_text() && only_unit.is_none() && unit_count > 1 {
+                plan.errors.push(format!(
+                    "{name}: '{reference}' has {} placed units, so a field position needs 'unit' — \
+                     an absolute coordinate cannot be right for all of them",
+                    unit_count
+                ));
+                continue;
+            }
+            match set_property_placement(content, reference, name, &placement, only_unit) {
+                Ok((updated, touched)) => {
+                    *content = updated;
+                    plan.applied.push((name.clone(), placement));
+                    plan.unit = only_unit;
+                    plan.changes
+                        .push(format!("{name} placement ({touched} unit(s))"));
+                }
+                // A malformed file aborts the whole call. This handler edits
+                // text and commits once, at the end, so a sibling edit that
+                // succeeded would otherwise be written into a file already
+                // found to be broken: the refusal would be reported while the
+                // write went ahead anyway.
+                Err(refusal @ PlacementRefusal::MalformedFile(_)) => {
+                    return Err(FieldPlacementFailure {
+                        abort_batch: true,
+                        error: CallToolResult::error(format!(
+                            "No fields were updated on '{reference}': {name}: {}",
+                            refusal.reason()
+                        )),
+                    })
+                }
+                Err(refusal) => plan.errors.push(format!("{name}: {}", refusal.reason())),
+            }
+        }
+    }
+
+    Ok(plan)
+}
+
+pub(crate) struct BatchFieldPlacements {
+    pub(crate) changes: Vec<String>,
+    pub(crate) errors: Vec<String>,
+    pub(crate) intent: ComponentMutationIntent,
+}
+
+/// Plan with the same parser and placement writer as the single tool. Bind
+/// UUIDs and body geometry before moving text so readback cannot bless a body
+/// move merely because the requested field position was also written.
+pub(crate) fn plan_batch_field_placements(
+    path: &std::path::Path,
+    content: &mut String,
+    reference: &str,
+    args: &serde_json::Value,
+) -> Result<BatchFieldPlacements, FieldPlacementFailure> {
+    parse_sexp(content).map_err(|error| FieldPlacementFailure {
+        error: CallToolResult::error(format!("Schematic is malformed: {error}")),
+        abort_batch: true,
+    })?;
+    let target = component_target_from_source(path, content, reference)
+        .map_err(|error| FieldPlacementFailure::local(error.into_result()))?;
+    let plan = apply_field_placements(content, reference, args, target.units.len())?;
+    Ok(BatchFieldPlacements {
+        changes: plan.changes,
+        errors: plan.errors,
+        intent: ComponentMutationIntent::new(target).with_field_placements(plan.applied, plan.unit),
+    })
+}
+
+pub(crate) fn field_placement_unit(
+    args: &serde_json::Value,
+) -> Result<Option<u32>, CallToolResult> {
+    match opt_u32(args, "unit")? {
+        Some(0) => Err(crate::tools::invalid_arg(
+            "unit",
+            "expected a positive integer unit number",
+        )),
+        unit => Ok(unit),
+    }
+}
+
+pub(crate) fn validate_field_placement_unit_scope(
+    args: &serde_json::Value,
+    whole_part_flag: Option<&str>,
+) -> Result<(), CallToolResult> {
+    if let Some(flag) = whole_part_flag {
+        if !args["unit"].is_null()
+            && args["field_placements"]
+                .as_object()
+                .is_none_or(|p| p.is_empty())
+        {
+            return Err(crate::tools::invalid_arg(
+                "unit",
+                &format!("selects the unit for field_placements only; {flag} is set on every placed unit"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// What `edit_schematic_component` may change about where a field's text sits.
 /// Every part is optional: an absent one leaves the file's value alone rather
 /// than defaulting, so moving a field cannot silently unhide it.
@@ -3379,19 +3599,8 @@ async fn handle_edit_schematic_component(
     let whole_part_flag = requested_dnp
         .map(|_| "dnp")
         .or_else(|| requested_flags.first().map(|(flag, _)| *flag));
-    if let Some(flag) = whole_part_flag {
-        if !args["unit"].is_null()
-            && args["field_placements"]
-                .as_object()
-                .is_none_or(|p| p.is_empty())
-        {
-            return Ok(crate::tools::invalid_arg(
-                "unit",
-                &format!(
-                    "selects the unit for field_placements only; {flag} is set on every placed unit"
-                ),
-            ));
-        }
+    if let Err(error) = validate_field_placement_unit_scope(args, whole_part_flag) {
+        return Ok(error);
     }
     // A property named DNP refuses the whole request, before anything is
     // read for writing: none of its other edits is applied either.
@@ -3607,95 +3816,15 @@ async fn handle_edit_schematic_component(
     // overloading one argument's value type would make the schema lie about
     // what it accepts.
     let placements = args["field_placements"].as_object();
-    let mut applied_placements: Vec<(String, FieldPlacement)> = Vec::new();
-    let mut placement_unit: Option<u32> = None;
-    if let Some(placements) = placements {
-        let only_unit = match opt_u32(args, "unit") {
-            Ok(Some(0)) => {
-                return Ok(crate::tools::invalid_arg(
-                    "unit",
-                    "expected a positive integer unit number",
-                ))
-            }
-            Ok(unit) => unit,
-            Err(error) => return Ok(error),
-        };
-        for (name, spec) in placements {
-            let Some(spec) = spec.as_object() else {
-                errors.push(format!("{name}: field_placements entries must be objects"));
-                continue;
-            };
-            let mut placement = FieldPlacement::default();
-            let mut bad = false;
-            for (key, slot) in [
-                ("x", &mut placement.x),
-                ("y", &mut placement.y),
-                ("rotation", &mut placement.rotation),
-            ] {
-                match spec.get(key) {
-                    None | Some(serde_json::Value::Null) => {}
-                    Some(value) => match value.as_f64() {
-                        Some(number) => *slot = Some(number),
-                        None => {
-                            errors.push(format!("{name}.{key}: expected a number"));
-                            bad = true;
-                        }
-                    },
-                }
-            }
-            match spec.get("hide") {
-                None | Some(serde_json::Value::Null) => {}
-                Some(value) => match value.as_bool() {
-                    Some(hide) => placement.hide = Some(hide),
-                    None => {
-                        errors.push(format!("{name}.hide: expected true or false"));
-                        bad = true;
-                    }
-                },
-            }
-            if bad {
-                continue;
-            }
-            if placement.is_empty() {
-                errors.push(format!(
-                    "{name}: field_placements entry sets nothing — give x, y, rotation or hide"
-                ));
-                continue;
-            }
-            // A field's position is absolute, so one coordinate cannot be
-            // right for several placements. Writing it to every unit would
-            // stack the text of a quad gate's four Values on one point and
-            // report success.
-            if placement.moves_the_text() && only_unit.is_none() && target.units.len() > 1 {
-                errors.push(format!(
-                    "{name}: '{reference}' has {} placed units, so a field position needs 'unit' — \
-                     an absolute coordinate cannot be right for all of them",
-                    target.units.len()
-                ));
-                continue;
-            }
-            match set_property_placement(&content, edit_reference, name, &placement, only_unit) {
-                Ok((updated, touched)) => {
-                    content = updated;
-                    applied_placements.push((name.clone(), placement));
-                    placement_unit = only_unit;
-                    changed.push(format!("{name} placement ({touched} unit(s))"));
-                }
-                // A malformed file aborts the whole call. This handler edits
-                // text and commits once, at the end, so a sibling edit that
-                // succeeded would otherwise be written into a file already
-                // found to be broken: the refusal would be reported while the
-                // write went ahead anyway.
-                Err(refusal @ PlacementRefusal::MalformedFile(_)) => {
-                    return Ok(CallToolResult::error(format!(
-                        "No fields were updated on '{reference}': {name}: {}",
-                        refusal.reason()
-                    )))
-                }
-                Err(refusal) => errors.push(format!("{name}: {}", refusal.reason())),
-            }
-        }
-    }
+    let plan = match apply_field_placements(&mut content, edit_reference, args, target.units.len())
+    {
+        Ok(plan) => plan,
+        Err(failure) => return Ok(failure.error),
+    };
+    changed.extend(plan.changes);
+    errors.extend(plan.errors);
+    let applied_placements = plan.applied;
+    let placement_unit = plan.unit;
 
     // A request that changed nothing is a failure, not a success — silently
     // reporting `"changes": []` is what let the tab-indentation bug hide, and
@@ -13683,5 +13812,276 @@ mod mirror_component_tests {
         assert!(tools()
             .iter()
             .any(|tool| tool.name == "mirror_schematic_component"));
+    }
+}
+
+/// A write KiCad's editor lock refused wrote nothing, so it is a `conflict`
+/// refusal that names the lock, never `mutation_outcome_uncertain` (#427).
+#[cfg(test)]
+mod editor_lock_refusal_tests {
+    use crate::tools::ServerConfig;
+    use serde_json::{json, Value};
+
+    const PLACED: &str = include_str!("../../tests/fixtures/derived_lib_name.kicad_sch");
+    const UNANNOTATED: &str = include_str!("../../tests/fixtures/annotate_duplicates.kicad_sch");
+
+    #[tokio::test]
+    async fn served_placement_and_annotation_refuse_a_locked_schematic() {
+        let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+            eager_toolsets: true,
+            ..ServerConfig::default()
+        })
+        .await
+        .unwrap();
+        let cases = [
+            (
+                "add_schematic_component",
+                ("derived_lib_name", PLACED),
+                json!({ "lib_id": "Device:R", "x": 190.5, "y": 101.6, "reference": "R9" }),
+                1,
+            ),
+            (
+                "batch_place_components",
+                ("derived_lib_name", PLACED),
+                json!({ "components": [
+                    { "lib_id": "Device:R", "x": 190.5, "y": 101.6, "reference": "R9" },
+                    { "lib_id": "Device:R", "x": 203.2, "y": 101.6, "reference": "R10" }
+                ] }),
+                2,
+            ),
+            (
+                "annotate_schematic",
+                ("adj", UNANNOTATED),
+                json!({}),
+                // Two `C?` to number, and the duplicate `R1`s left unresolved.
+                3,
+            ),
+        ];
+        for (tool, (project, source), mut arguments, requested) in cases {
+            // Named after the fixture's project, which its instances record.
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(format!("{project}.kicad_sch"));
+            std::fs::write(&path, source).unwrap();
+            std::fs::write(dir.path().join(format!("{project}.kicad_pro")), "{}\n").unwrap();
+            let lock = dir.path().join(format!("~{project}.kicad_sch.lck"));
+            std::fs::write(&lock, r#"{"hostname":"x","username":"y"}"#).unwrap();
+            arguments["schematic"] = json!(path.display().to_string());
+
+            let response = handler
+                .handle_message(json!({
+                    "jsonrpc": "2.0", "id": 427, "method": "tools/call",
+                    "params": { "name": tool, "arguments": arguments }
+                }))
+                .await
+                .unwrap()
+                .result
+                .unwrap();
+            assert_eq!(response["isError"], true, "{tool}: {response}");
+            let body: Value =
+                serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(body["error"]["kind"], "conflict", "{tool}: {body}");
+            assert_eq!(
+                body["error"]["paths"],
+                json!([path.display().to_string()]),
+                "{tool}: {body}"
+            );
+            let message = body["message"].as_str().unwrap();
+            assert!(message.contains("wrote nothing"), "{tool}: {body}");
+            assert!(
+                message.contains(&lock.display().to_string()),
+                "{tool}: {body}"
+            );
+            let outcome = &body["outcome"];
+            assert_eq!(outcome["status"], "failed", "{tool}: {body}");
+            assert_eq!(outcome["completed"], 0, "{tool}: {body}");
+            assert_eq!(outcome["failed"], requested, "{tool}: {body}");
+            assert_eq!(outcome["retry"]["safe"], true, "{tool}: {body}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), source, "{tool}");
+            assert!(lock.exists(), "{tool} must leave KiCad's lock alone");
+        }
+    }
+}
+
+#[cfg(test)]
+mod root_editor_lock_tests {
+    use crate::mcp::handler::McpHandler;
+    use crate::tools::ServerConfig;
+    use serde_json::{json, Value};
+
+    async fn call(handler: &McpHandler, name: &str, arguments: Value) -> Value {
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0", "id": 428, "method": "tools/call",
+                "params": { "name": name, "arguments": arguments }
+            }))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap()
+    }
+
+    /// Tools that report an `outcome` envelope with their refusal.
+    const OUTCOME_TOOLS: [&str; 3] = [
+        "add_schematic_component",
+        "batch_place_components",
+        "annotate_schematic",
+    ];
+
+    async fn root_lock_case(tool: &str, mut arguments: Value) {
+        let handler = McpHandler::new(ServerConfig {
+            eager_toolsets: true,
+            ..ServerConfig::default()
+        })
+        .await
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let names = [
+            "nested_pages.kicad_pro",
+            "nested_pages.kicad_sch",
+            "bank.kicad_sch",
+            "cell.kicad_sch",
+        ];
+        for name in names {
+            std::fs::copy(
+                fixtures.join("annotate_nested_hierarchy").join(name),
+                directory.path().join(name),
+            )
+            .unwrap();
+        }
+        let child = directory.path().join("bank.kicad_sch");
+        // Use the existing KiCad-authored library, independent of installed libraries.
+        let library = fixtures.join("reference_prefix_kicad10/Device.kicad_sym");
+        std::fs::write(directory.path().join("sym-lib-table"), format!(
+            "(sym_lib_table (version 7) (lib (name \"Device\") (type \"KiCad\") (uri {}) (options \"\") (descr \"\")))",
+            crate::tools::library::quote_lib_table_string(&library.display().to_string())
+        )).unwrap();
+        // An unannotated part for annotation, and R99 for the tools that edit one.
+        // `bank` is placed twice, so annotation would also see R99 as a duplicate.
+        let parts: &[_] = if tool == "annotate_schematic" {
+            &[(200.66, None)]
+        } else {
+            &[(200.66, None), (226.06, Some("R99"))]
+        };
+        for &(x, reference) in parts {
+            let mut part = json!({ "schematic": child, "lib_id": "Device:R", "x": x, "y": 101.6 });
+            if let Some(reference) = reference {
+                part["reference"] = json!(reference);
+            }
+            let prepared = call(&handler, "add_schematic_component", part).await;
+            assert_eq!(prepared["outcome"]["status"], "complete", "{prepared}");
+        }
+        let before: Vec<_> = names
+            .iter()
+            .map(|name| std::fs::read(directory.path().join(name)).unwrap())
+            .collect();
+        let root = directory.path().join("nested_pages.kicad_sch");
+        let lock = directory.path().join("~nested_pages.kicad_sch.lck");
+        std::fs::write(&lock, r#"{"hostname":"x","username":"y"}"#).unwrap();
+        arguments["schematic"] = json!(child);
+        let refused = call(&handler, tool, arguments.clone()).await;
+        if tool == "delete_schematic_component" {
+            // Its document binding sees the root lock before the writer does.
+            assert_eq!(refused["error"]["kind"], "stale_target", "{refused}");
+            assert_eq!(refused["error"]["target"], json!(child), "{refused}");
+        } else {
+            assert_eq!(refused["error"]["kind"], "conflict", "{tool}: {refused}");
+            assert_eq!(refused["error"]["paths"], json!([root]), "{refused}");
+            let message = refused["message"].as_str().unwrap();
+            assert!(message.contains(&root.display().to_string()), "{refused}");
+        }
+        if OUTCOME_TOOLS.contains(&tool) {
+            let message = refused["message"].as_str().unwrap();
+            assert!(message.contains(&lock.display().to_string()), "{refused}");
+            assert_eq!(refused["outcome"]["status"], "failed", "{refused}");
+            assert_eq!(refused["outcome"]["completed"], 0, "{refused}");
+            assert_eq!(refused["outcome"]["retry"]["safe"], true, "{refused}");
+        }
+        for (name, expected) in names.iter().zip(&before) {
+            assert_eq!(
+                &std::fs::read(directory.path().join(name)).unwrap(),
+                expected,
+                "{tool}: {name}"
+            );
+        }
+        assert!(lock.exists());
+        if tool == "annotate_schematic" {
+            let mut dry = arguments.clone();
+            dry["dry_run"] = json!(true);
+            let planned = call(&handler, tool, dry).await;
+            assert_eq!(planned["outcome"]["status"], "complete", "{planned}");
+            assert_eq!(std::fs::read(&child).unwrap(), before[2]);
+        }
+        // The same request succeeds once Eeschema releases its root lock.
+        std::fs::remove_file(lock).unwrap();
+        let applied = call(&handler, tool, arguments).await;
+        assert!(applied.get("error").is_none(), "{tool}: {applied}");
+        assert_ne!(std::fs::read(&child).unwrap(), before[2], "{tool}");
+        for index in [0, 1, 3] {
+            assert_eq!(
+                std::fs::read(directory.path().join(names[index])).unwrap(),
+                before[index],
+                "{tool}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn root_lock_refuses_single_child_placement() {
+        root_lock_case(
+            "add_schematic_component",
+            json!({"lib_id":"Device:R", "x":251.46,"y":101.6,"reference":"R98"}),
+        )
+        .await;
+    }
+    #[tokio::test]
+    async fn root_lock_refuses_batch_child_placement() {
+        root_lock_case(
+            "batch_place_components",
+            json!({"components":[{"lib_id":"Device:R", "x":251.46,"y":101.6,"reference":"R98"}]}),
+        )
+        .await;
+    }
+    #[tokio::test]
+    async fn root_lock_refuses_child_template() {
+        root_lock_case("apply_template", json!({"template_id":"i2c_pullups"})).await;
+    }
+    #[tokio::test]
+    async fn root_lock_refuses_child_file_annotation() {
+        root_lock_case("annotate_schematic", json!({"schematic_scope":"file"})).await;
+    }
+
+    /// Every other sheet writer reaches the same check in the shared writer.
+    #[tokio::test]
+    async fn root_lock_refuses_other_child_writes() {
+        let cases = [
+            (
+                "add_wire",
+                json!({"x1": 100.33, "y1": 50.8, "x2": 120.65, "y2": 50.8}),
+            ),
+            ("add_junction", json!({"x": 100.33, "y": 50.8})),
+            ("add_no_connect", json!({"x": 100.33, "y": 50.8})),
+            (
+                "add_schematic_net_label",
+                json!({"net": "SIG", "x": 100.33, "y": 50.8}),
+            ),
+            (
+                "move_schematic_component",
+                json!({"reference": "R99", "x": 251.46, "y": 101.6}),
+            ),
+            (
+                "edit_schematic_component",
+                json!({"reference": "R99", "value": "10k"}),
+            ),
+            ("delete_schematic_component", json!({"reference": "R99"})),
+            (
+                "batch_edit_schematic_components",
+                json!({"edits":[{"reference":"R99", "field_placements":{"Value":{"x":238.76,"y":104.14}}}]}),
+            ),
+        ];
+        for (tool, arguments) in cases {
+            root_lock_case(tool, arguments).await;
+        }
     }
 }

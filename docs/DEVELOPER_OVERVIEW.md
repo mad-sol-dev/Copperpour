@@ -20,7 +20,7 @@ loads domain toolsets on demand, and routes each call to a file, IPC, or
 | S-expression engine | `crates/copperpour-sexp` | KiCad file parsing/writing, atomic edits, reversible commands, and transaction journals |
 | Typed schematic editor | `crates/copperpour-schematic-editor` | Higher-level schematic parse, mutation, library resolution, and serialization |
 | KiCad IPC client | `crates/copperpour-ipc` | Typed KiCad IPC messages, NNG transport, board targeting, and failure classification |
-| Schematic viewer | `crates/schematic-viewer` | Separate Tauri application for live schematic rendering |
+| Viewer engine | `crates/copperpour-viewer` | Viewer engine, root-bound loopback browser service and embedded frontend assets |
 | KiCad launcher plugin | `plugin` | Python ActionPlugin and settings UI for the packaged server |
 | Packaging | `packaging` | KiCad PCM metadata, package assembly, and package validation |
 
@@ -60,3 +60,14 @@ decision and its safety gates are described in
    paths and the gates between them.
 5. [Testing and release](TESTING_AND_RELEASE.md) maps changes to tests, CI, live
    KiCad validation, documentation, and packaging.
+
+The MCP browser viewer registry lives on `ToolContext` and reuses services by canonical
+root schematic. `open_schematic_viewer` returns a private URL plus separate OS-opener
+status; `open_browser: false` supports headless use. See the
+[browser migration](api-migrations/browser-viewer-mcp.md).
+
+Server guidance lives in `copperpour-core::guidance`: short `initialize` rules and
+one shared embedded catalog for resources, `get_guidance`, and the native skill
+installer. See [server guidance](ARCHITECTURE.md#server-guidance). Native skill
+installation stays optional; the running server’s guidance is independent of
+local file drift.

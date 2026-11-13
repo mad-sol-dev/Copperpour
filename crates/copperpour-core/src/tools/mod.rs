@@ -45,6 +45,8 @@ pub mod library;
 mod library_footprint;
 pub(crate) mod live_board;
 pub mod manufacturing;
+#[cfg(test)]
+mod modify_trace_tests;
 pub(crate) mod navigation_target;
 mod pad_nets;
 pub mod pcb_board;
@@ -58,6 +60,7 @@ pub mod pcb_export;
 pub(crate) mod pcb_footprint_update;
 pub mod pcb_routing;
 pub(crate) mod pcb_sync;
+pub(crate) mod pcb_text;
 mod placed_footprint_models;
 pub mod placement;
 pub mod project;
@@ -66,6 +69,8 @@ mod project_file_writer_tests;
 #[cfg(test)]
 mod readback_mismatch_tests;
 mod reference_hint;
+#[cfg(test)]
+mod revision_conflict_tests;
 #[cfg(test)]
 mod route_obstacle_tests;
 pub mod sch_analysis;
@@ -96,6 +101,7 @@ pub(crate) mod title_block_args;
 #[cfg(test)]
 mod top_level_sheet_tests;
 pub mod verification;
+mod viewer;
 
 use crate::mcp::protocol::{CallToolResult, McpToolDescription};
 use crate::router::ToolRouter;
@@ -304,6 +310,8 @@ pub struct ToolContext {
     pub observer: crate::observability::CallObserver,
     /// In-memory TTL cache for repeated JLCPCB parts-database queries.
     pub jlcpcb_cache: QueryCache,
+    /// Context-owned browser viewers, keyed by canonical root schematic.
+    viewers: viewer::ViewerRegistry,
     /// Boards positively observed open through IPC during this server process.
     /// Sticky state prevents an unsafe file fallback after KiCad disappears.
     pub(crate) board_session: board_session::BoardSessionMemory,
@@ -327,11 +335,13 @@ impl ToolContext {
     /// Construct a context with an in-memory-only observer (no JSONL). Used by
     /// tests and by callers that don't need persistent call logs.
     pub fn new(config: ServerConfig, router: Arc<ToolRouter>) -> Self {
+        install_schematic_editor_owners();
         ToolContext {
             config: config.normalized(),
             router,
             observer: crate::observability::CallObserver::new(None),
             jlcpcb_cache: QueryCache::default(),
+            viewers: viewer::ViewerRegistry::default(),
             board_session: board_session::BoardSessionMemory::default(),
             config_resolution: crate::config_resolution::ConfigResolution::unavailable(),
             guidance: std::sync::OnceLock::new(),
@@ -346,11 +356,13 @@ impl ToolContext {
         router: Arc<ToolRouter>,
         observer: crate::observability::CallObserver,
     ) -> Self {
+        install_schematic_editor_owners();
         ToolContext {
             config: config.normalized(),
             router,
             observer,
             jlcpcb_cache: QueryCache::default(),
+            viewers: viewer::ViewerRegistry::default(),
             board_session: board_session::BoardSessionMemory::default(),
             config_resolution: crate::config_resolution::ConfigResolution::unavailable(),
             guidance: std::sync::OnceLock::new(),
@@ -1168,6 +1180,35 @@ pub(crate) fn readback_mismatch_path(error: &anyhow::Error) -> Option<&std::path
     None
 }
 
+/// The file a write refused because it changed after the caller read it, when
+/// that is what `error` reports. The writer refuses before the rename, so
+/// nothing was written to it: a `conflict` refusal, not an uncertain outcome.
+pub(crate) fn revision_conflict_path(error: &anyhow::Error) -> Option<&std::path::Path> {
+    for cause in error.chain() {
+        if let Some(copperpour_sexp::SexpError::Conflict { path }) = cause.downcast_ref() {
+            return Some(path);
+        }
+        if let Some(copperpour_schematic_editor::Error::Conflict(path)) = cause.downcast_ref() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// The `conflict` refusal for a write `operation` that the writer refused
+/// because `path` changed after it was read.
+pub(crate) fn revision_conflict_result(path: &std::path::Path, operation: &str) -> CallToolResult {
+    let extension = path.extension().and_then(|e| e.to_str());
+    let what = match extension.map(str::to_ascii_lowercase).as_deref() {
+        Some("kicad_sch") => "schematic",
+        Some("kicad_pcb") => "board",
+        Some("kicad_sym") => "symbol library",
+        Some("kicad_mod") => "footprint",
+        _ => "file",
+    };
+    changed_after_read(path, what, operation)
+}
+
 /// The `mutation_outcome_uncertain` result for a write `operation` that
 /// replaced `path` but could not read it back as written.
 pub(crate) fn readback_mismatch_result(path: &std::path::Path, operation: &str) -> CallToolResult {
@@ -1176,6 +1217,126 @@ pub(crate) fn readback_mismatch_result(path: &std::path::Path, operation: &str) 
         operation,
         "the file was replaced, but did not read back as written; another program may have \
          saved it in between",
+    )
+}
+
+/// A KiCad editor lock that refused a write: the document, its lock file, and
+/// why the lock file could not be inspected, when that is what happened.
+pub(crate) struct LockedDocument<'e> {
+    pub path: &'e std::path::Path,
+    pub lock_path: &'e std::path::Path,
+    pub inspection_error: Option<&'e str>,
+}
+
+/// The KiCad editor lock that `error` reports.
+pub(crate) fn kicad_editor_lock<'e>(
+    error: &'e (dyn std::error::Error + 'static),
+) -> Option<LockedDocument<'e>> {
+    let (path, lock_path, inspection_error) = match (error.downcast_ref(), error.downcast_ref()) {
+        (
+            Some(copperpour_sexp::SexpError::KiCadEditorLocked {
+                path,
+                lock_path,
+                inspection_error,
+            }),
+            _,
+        )
+        | (
+            _,
+            Some(copperpour_schematic_editor::Error::KiCadEditorLocked {
+                path,
+                lock_path,
+                inspection_error,
+            }),
+        ) => (path, lock_path, inspection_error),
+        _ => return None,
+    };
+    Some(LockedDocument {
+        path,
+        lock_path,
+        inspection_error: inspection_error.as_deref(),
+    })
+}
+
+/// The editor schematics whose KiCad lock also guards a write to `path`
+/// (#428). With several candidate projects, any of them may hold the sheet.
+fn schematic_editor_owners(path: &std::path::Path) -> Result<Vec<std::path::PathBuf>, String> {
+    if path
+        .extension()
+        .is_none_or(|extension| extension != "kicad_sch")
+    {
+        return Ok(Vec::new());
+    }
+    match resolve_schematic_ownership(path) {
+        Ok(ownership) => Ok(ownership
+            .map(|o| o.editor_schematic())
+            .into_iter()
+            .collect()),
+        Err(SchematicTargetError::ProjectConflict { .. }) => Ok(candidate_project_files(path)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|project| project.with_extension("kicad_sch"))
+            .collect()),
+        Err(error) => Err(format!("the owning project's editor lock: {error}")),
+    }
+}
+
+/// Makes every schematic write in this process check its owning root's lock.
+pub(crate) fn install_schematic_editor_owners() {
+    copperpour_sexp::writer::set_editor_owners(schematic_editor_owners);
+}
+
+/// The `conflict` refusal for a schematic write that `error` shows never
+/// happened: KiCad's editor lock blocked it, or the file changed after it was
+/// read. Single-file writers check both before the rename, so the file is as
+/// it was (#427); a transaction only before its journal. `None` for any other
+/// error, which may come after the rename.
+pub(crate) fn unwritten_schematic_refusal(
+    operation: &str,
+    error: &(dyn std::error::Error + 'static),
+) -> Option<CallToolResult> {
+    use copperpour_schematic_editor::Error as EditorError;
+    use copperpour_sexp::SexpError;
+    if let Some(locked) = kicad_editor_lock(error) {
+        // `paths` names the schematic, as dispatch's lock refusal does.
+        let shown = copperpour_sexp::paths::display_path(locked.path);
+        let lock = copperpour_sexp::paths::display_path(locked.lock_path);
+        let message = match locked.inspection_error {
+            None => format!(
+                "KiCad's editor lock '{lock}' is present, so {operation} wrote nothing to \
+                 '{shown}'. Save and close the schematic in Eeschema, then retry. Remove a \
+                 stale lock only after confirming that no editor owns the file."
+            ),
+            Some(reason) => format!(
+                "KiCad's editor lock '{lock}' could not be checked ({reason}), so {operation} \
+                 wrote nothing to '{shown}'. Make the lock path readable, then retry."
+            ),
+        };
+        return Some(CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::Conflict { paths: vec![shown] },
+            message,
+        ));
+    }
+    let changed = match (error.downcast_ref(), error.downcast_ref()) {
+        (Some(SexpError::Conflict { path } | SexpError::TransactionConflict { path, .. }), _)
+        | (_, Some(EditorError::Conflict(path))) => path,
+        _ => return None,
+    };
+    Some(changed_after_read(changed, "schematic", operation))
+}
+
+/// The `conflict` refusal for a `what` file that changed after Copperpour
+/// read it, so `operation` wrote nothing.
+fn changed_after_read(path: &std::path::Path, what: &str, operation: &str) -> CallToolResult {
+    let shown = copperpour_sexp::paths::display_path(path);
+    CallToolResult::error_kind(
+        crate::mcp::error::ToolErrorKind::Conflict {
+            paths: vec![shown.clone()],
+        },
+        format!(
+            "The {what} '{shown}' changed after Copperpour read it, so {operation} wrote \
+             nothing. Reload it and retry."
+        ),
     )
 }
 
@@ -1268,18 +1429,9 @@ pub(crate) fn replace_outcome(
     operation: &str,
     written: Result<bool, copperpour_sexp::SexpError>,
 ) -> anyhow::Result<Option<CallToolResult>> {
-    let shown = path.display().to_string();
     match written {
         Ok(true) => Ok(None),
-        Ok(false) => Ok(Some(CallToolResult::error_kind(
-            crate::mcp::error::ToolErrorKind::Conflict {
-                paths: vec![shown.clone()],
-            },
-            format!(
-                "The {what} '{shown}' changed after Copperpour read it, so {operation} wrote \
-                 nothing. Reload it and retry."
-            ),
-        ))),
+        Ok(false) => Ok(Some(changed_after_read(path, what, operation))),
         Err(copperpour_sexp::SexpError::ReadbackMismatch { .. }) => {
             Ok(Some(readback_mismatch_result(path, operation)))
         }
@@ -2148,6 +2300,21 @@ pub(crate) const FALLBACK_VALUE_AT: (f64, f64, f64) = (0.0, -3.81, 0.0);
 
 // ─── Response helpers ────────────────────────────────────────────────────────
 
+/// Read a presentation limit without narrowing through `u64` or silently
+/// defaulting malformed direct calls. JSON Schema also accepts integral floats.
+pub(crate) fn response_limit(
+    args: &serde_json::Value,
+    default: usize,
+) -> Result<usize, CallToolResult> {
+    match args.get("limit") {
+        None => Ok(default),
+        Some(value) => match value.as_f64() {
+            Some(limit) if limit >= 0.0 && limit.fract() == 0.0 => Ok(limit as usize),
+            _ => Err(invalid_arg("limit", "expected a non-negative integer")),
+        },
+    }
+}
+
 /// The first `limit` entries of a list a response renders, with how many it
 /// holds (#69), for the `shown` and `truncated` that `run_drc` reports
 /// beside its list.
@@ -2177,6 +2344,27 @@ impl<'a, T> BoundedList<'a, T> {
 #[cfg(test)]
 mod bounded_list_tests {
     use super::BoundedList;
+
+    #[test]
+    fn bounded_response_limit_accepts_integral_numbers_and_refuses_bad_direct_calls() {
+        for (args, expected) in [
+            (serde_json::json!({}), 50),
+            (serde_json::json!({"limit":0}), 0),
+            (serde_json::json!({"limit":1.0}), 1),
+            (serde_json::json!({"limit": u64::MAX}), usize::MAX),
+        ] {
+            assert_eq!(super::response_limit(&args, 50).unwrap(), expected);
+        }
+        for limit in [
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!(null),
+            serde_json::json!("1"),
+            serde_json::json!(true),
+        ] {
+            assert!(super::response_limit(&serde_json::json!({"limit": limit}), 50).is_err());
+        }
+    }
 
     #[test]
     fn a_list_over_its_limit_shows_the_first_entries_and_counts_them_all() {
@@ -3948,6 +4136,113 @@ mod ipc_failure_evidence_tests {
         });
         assert_eq!(evidence["kind"], "request_failed");
         assert_eq!(evidence["message"], "AS_NOT_READY");
+    }
+}
+
+#[cfg(test)]
+mod unwritten_schematic_refusal_tests {
+    use super::unwritten_schematic_refusal;
+    use crate::mcp::error::extract_error_kind;
+    use copperpour_schematic_editor::Error as EditorError;
+    use copperpour_sexp::SexpError;
+    fn kind(error: &(dyn std::error::Error + 'static)) -> Option<String> {
+        unwritten_schematic_refusal("op", error).map(|result| extract_error_kind(&result).unwrap())
+    }
+
+    /// Only errors the writer raises before the rename are refusals; the rest,
+    /// a readback mismatch above all, may follow a replacement (#427).
+    #[test]
+    fn only_errors_before_the_rename_are_refusals() {
+        let conflict = Some("conflict".to_string());
+        assert_eq!(
+            kind(&SexpError::KiCadEditorLocked {
+                path: "a.kicad_sch".into(),
+                lock_path: "~a.kicad_sch.lck".into(),
+                inspection_error: Some("denied".into()),
+            }),
+            conflict
+        );
+        assert_eq!(
+            kind(&EditorError::KiCadEditorLocked {
+                path: "a.kicad_sch".into(),
+                lock_path: "~a.kicad_sch.lck".into(),
+                inspection_error: None,
+            }),
+            conflict
+        );
+        assert_eq!(
+            kind(&SexpError::TransactionConflict {
+                path: "a.kicad_sch".into(),
+                journal: "j.json".into(),
+                reason: "changed".into(),
+            }),
+            conflict
+        );
+        assert_eq!(
+            kind(&SexpError::Conflict {
+                path: "a.kicad_sch".into()
+            }),
+            conflict
+        );
+        assert_eq!(kind(&EditorError::Conflict("a.kicad_sch".into())), conflict);
+        assert_eq!(
+            kind(&SexpError::ReadbackMismatch {
+                path: "a.kicad_sch".into()
+            }),
+            None
+        );
+        assert_eq!(
+            kind(&EditorError::ReadbackMismatch("a.kicad_sch".into())),
+            None
+        );
+        assert_eq!(kind(&SexpError::Io(std::io::Error::other("disk"))), None);
+        assert_eq!(kind(&EditorError::Io(std::io::Error::other("disk"))), None);
+    }
+
+    /// The writer reports the paths it resolved, which on Windows carry the
+    /// `\\?\` verbatim prefix; the refusal shows them as a user types them.
+    #[test]
+    fn a_refusal_shows_paths_without_the_verbatim_prefix() {
+        let locked = SexpError::KiCadEditorLocked {
+            path: r"\\?\C:\p\a.kicad_sch".into(),
+            lock_path: r"\\?\C:\p\~a.kicad_sch.lck".into(),
+            inspection_error: None,
+        };
+        let changed = SexpError::TransactionConflict {
+            path: r"\\?\C:\p\a.kicad_sch".into(),
+            journal: r"\\?\C:\p\j.json".into(),
+            reason: "changed".into(),
+        };
+        for error in [locked, changed] {
+            let result = unwritten_schematic_refusal("op", &error).unwrap();
+            let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+                panic!("{result:?}");
+            };
+            assert!(!text.contains(r"\\?\"), "{text}");
+            assert!(text.contains(r"C:\\p\\a.kicad_sch"), "{text}");
+        }
+    }
+
+    /// A lock path that could not be inspected is not reported as a lock that
+    /// is present.
+    #[test]
+    fn an_unreadable_lock_is_not_called_present() {
+        let message = |inspection_error: Option<&str>| {
+            let error = SexpError::KiCadEditorLocked {
+                path: "a.kicad_sch".into(),
+                lock_path: "~a.kicad_sch.lck".into(),
+                inspection_error: inspection_error.map(str::to_owned),
+            };
+            let result = unwritten_schematic_refusal("op", &error).unwrap();
+            match &result.content[0] {
+                crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
+                other => panic!("{other:?}"),
+            }
+        };
+        assert!(message(None).contains("is present"));
+        let unreadable = message(Some("permission denied"));
+        assert!(!unreadable.contains("is present"), "{unreadable}");
+        assert!(unreadable.contains("permission denied"), "{unreadable}");
     }
 }
 
