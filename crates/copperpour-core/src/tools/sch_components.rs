@@ -410,7 +410,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "group_components",
-            "Add or update a group property on every placed unit of multiple components. On a sheet placed more than once, the change reaches every instance of the sheet.",
+            "Add or update a group property on every placed unit of multiple components. This is a plain symbol field named 'Group': KiCad creates no group from it in the schematic or on the board. For a KiCad board group use group_footprints. On a sheet placed more than once, the change reaches every instance of the sheet.",
             json!({
                 "type": "object",
                 "properties": {

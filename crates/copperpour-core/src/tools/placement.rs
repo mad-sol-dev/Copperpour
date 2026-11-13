@@ -49,6 +49,7 @@
 //! Every response field is derived from the parsed board — never echoed from
 //! the request (the recurring defect class this repo pins tests against).
 
+mod groups;
 mod overview;
 mod plan_status;
 
@@ -202,6 +203,7 @@ pub fn tools() -> Vec<ToolDef> {
         )
         .with_board_access(crate::tools::BoardAccess::ApplyModeDependent),
         overview::tool(),
+        groups::tool(),
     ]
 }
 

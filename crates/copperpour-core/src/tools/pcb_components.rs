@@ -1150,7 +1150,7 @@ fn board_contains_reference(board_path: &Path, reference: &str) -> anyhow::Resul
     Ok(footprint_references(&content)?.contains(reference))
 }
 
-fn footprint_reference(footprint: &copperpour_sexp::SexpNode) -> Option<String> {
+pub(crate) fn footprint_reference(footprint: &copperpour_sexp::SexpNode) -> Option<String> {
     footprint
         .find_all("property")
         .into_iter()
